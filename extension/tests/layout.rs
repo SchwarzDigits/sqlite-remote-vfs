@@ -4,6 +4,9 @@ use std::ffi::c_int;
 use std::mem::offset_of;
 
 use sqlite_remote_vfs_ffi::SqliteRemoteVfsConfig as Config;
+// Links SQLite, which this test does not use otherwise: the MSVC linker requires every SQLite function that
+// rsqlite-vfs declares.
+use rusqlite as _;
 // Links this package's library, which carries c/layout.c compiled by build.rs.
 use sqlite_remote_vfs_extension_tests as _;
 

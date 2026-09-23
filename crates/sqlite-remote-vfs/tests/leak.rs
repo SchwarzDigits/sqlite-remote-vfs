@@ -4,6 +4,9 @@
 use std::sync::Arc;
 
 use sqlite_remote_vfs::{Algorithm, Config, Signer};
+// Links SQLite, which this test does not use otherwise: the MSVC linker requires every SQLite function that
+// rsqlite-vfs declares.
+use libsqlite3_sys as _;
 
 /// Test signer with a secret field. Like a real signer, it exposes only the public key.
 struct Keeper {
