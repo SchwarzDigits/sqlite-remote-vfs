@@ -142,15 +142,16 @@ Client and server exchange Protocol Buffers messages over a WebSocket, one binar
 defined in `proto/sqlite_remote/v1/sqlite_remote.proto`. `proto/testdata/v1/` contains one encoded sample of every
 message; a server implementation can check that it decodes and encodes them identically.
 
-A server implementation is not part of this repository.
+The server is [sqlite-remote-server](https://github.com/SchwarzDigits/sqlite-remote-server), written in Go, with an
+in-memory store and a PostgreSQL store.
 
 ## Not there yet
 
 - One database per registered VFS, one connection per database.
 - Recovery after the server was restored from a backup: a client that has seen commits the restored server no
   longer has is not handled yet. The protocol reserves a field number for it.
-- CI runs the tests that need no server natively on Linux and macOS and in Firefox, Chrome, Edge and Safari. The
-  tests against a server have so far run only locally: natively on macOS and in Firefox and Chrome. Not yet tested
+- CI runs all tests against [sqlite-remote-server](https://github.com/SchwarzDigits/sqlite-remote-server):
+  natively on Linux and macOS, against PostgreSQL on Linux, and in Firefox, Chrome, Edge and Safari. Not yet tested
   on Windows.
 - The extension and the static library are tested on Linux and macOS, not yet on Windows.
 
@@ -197,8 +198,10 @@ extension from `target/debug`:
 cargo build -p sqlite-remote-vfs-ext && (cd extension && cargo test)
 ```
 
-The tests in `remote.rs` and `tls.rs` need a running server and are skipped without `SQLITE_REMOTE_TEST_URL`. They
-log in with random keys. The TLS tests create their own CA and certificates and start a TLS terminator in front of
+The tests in `remote.rs` and `tls.rs` need a running
+[sqlite-remote-server](https://github.com/SchwarzDigits/sqlite-remote-server) and are skipped without
+`SQLITE_REMOTE_TEST_URL`. The server's `SQLITE_REMOTE_SERVER_ID` must equal that URL. The tests log in with random
+keys. The TLS tests create their own CA and certificates and start a TLS terminator in front of
 the server, so no system configuration is needed.
 
 ## Harness

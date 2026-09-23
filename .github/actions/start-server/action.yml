@@ -1,0 +1,48 @@
+name: Start page server
+description: >-
+  Installs sqlite-remote-server at the given commit, starts it in the background and sets SQLITE_REMOTE_TEST_URL for
+  the following steps.
+inputs:
+  version:
+    description: Commit or version of github.com/SchwarzDigits/sqlite-remote-server.
+    required: true
+  store:
+    description: memory or postgres.
+    default: memory
+  database-url:
+    description: PostgreSQL connection string, for the postgres store.
+    default: ""
+  port:
+    description: Port to listen on.
+    default: "18090"
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: stable
+        cache: false
+    - name: Install and start sqlite-remote-server
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        STORE: ${{ inputs.store }}
+        DATABASE_URL: ${{ inputs.database-url }}
+        PORT: ${{ inputs.port }}
+      run: |
+        go install "github.com/SchwarzDigits/sqlite-remote-server/cmd/sqlite-remote-server@$VERSION"
+        url="ws://127.0.0.1:$PORT/v1/ws"
+        # The browser tests load their page from 127.0.0.1 on another port.
+        SQLITE_REMOTE_PORT="$PORT" SQLITE_REMOTE_SERVER_ID="$url" SQLITE_REMOTE_STORE="$STORE" \
+          SQLITE_REMOTE_DATABASE_URL="$DATABASE_URL" SQLITE_REMOTE_ALLOWED_ORIGINS='127.0.0.1:*,localhost:*' \
+          nohup "$(go env GOPATH)/bin/sqlite-remote-server" > "$RUNNER_TEMP/sqlite-remote-server.log" 2>&1 &
+        for _ in $(seq 100); do
+          if curl -sf "http://127.0.0.1:$PORT/.well-known/ready" > /dev/null; then
+            echo "SQLITE_REMOTE_TEST_URL=$url" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          sleep 0.2
+        done
+        echo "sqlite-remote-server did not become ready:" >&2
+        cat "$RUNNER_TEMP/sqlite-remote-server.log" >&2
+        exit 1

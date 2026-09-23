@@ -15,8 +15,12 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Commit of github.com/SchwarzDigits/sqlite-remote-server that the tests run against. Raised deliberately, after
+  # the server's own CI passed.
+  SERVER_VERSION: ca989a5dc6c671edd3a89bac4eb809a714f1946e
 
-# Tests that need a page server skip themselves without SQLITE_REMOTE_TEST_URL. No server runs here.
+# Every job starts that server with the start-server action, which sets SQLITE_REMOTE_TEST_URL. The tests that need a
+# server skip themselves without it.
 jobs:
   native:
     name: Native (${{ matrix.os }})
@@ -31,6 +35,9 @@ jobs:
       - name: Install Rust from rust-toolchain.toml
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -41,6 +48,40 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  postgres:
+    name: End-to-end with PostgreSQL (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: vfs
+          POSTGRES_PASSWORD: vfs
+          POSTGRES_DB: vfs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vfs"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
+          store: postgres
+          database-url: postgres://vfs:vfs@127.0.0.1:5432/vfs?sslmode=disable
+      - name: Remote and TLS tests
+        run: cargo test -p sqlite-remote-vfs --test remote --test tls
+      # Kills a writing process at random and checks that no acknowledged commit is lost.
+      - name: Crash test
+        run: cargo run -p sqlite-remote-harness -- crash --url "$SQLITE_REMOTE_TEST_URL" --iterations 5
 
   extension:
     name: Extension (${{ matrix.os }})
@@ -59,6 +100,9 @@ jobs:
           workspaces: |
             . -> target
             extension -> target
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
       # The tests load the extension from target/debug.
       - name: Build the extension
         run: cargo build -p sqlite-remote-vfs-ext
@@ -86,6 +130,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: sqlcipher -> target
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -111,6 +158,9 @@ jobs:
       - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: wasm-bindgen@0.2.128
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
       # The runner image has llvm-ar only under a versioned name.
       - name: Find llvm-ar
         run: |
@@ -156,6 +206,9 @@ jobs:
             ar="$(brew --prefix llvm)/bin/llvm-ar"
           fi
           echo "AR_wasm32_unknown_unknown=$ar" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
       # Safari only accepts WebDriver sessions after remote automation is enabled. It has no headless mode.
       - name: Enable Safari's WebDriver
         run: sudo safaridriver --enable
