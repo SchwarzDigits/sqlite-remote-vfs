@@ -1,0 +1,21 @@
+[package]
+name = "sqlite-remote-vfs-extension-tests"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Tests of the C interface: the loadable extension and the static library, with plain SQLite"
+
+# A workspace of its own: these tests link plain SQLite, while the main workspace patches libsqlite3-sys to SQLite3
+# Multiple Ciphers.
+[workspace]
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false }
+getrandom = "0.3"
+libloading = "0.8"
+rusqlite = { version = "0.38", default-features = false, features = ["bundled", "load_extension"] }
+sqlite-remote-vfs-ffi = { path = "../crates/sqlite-remote-vfs-ffi" }

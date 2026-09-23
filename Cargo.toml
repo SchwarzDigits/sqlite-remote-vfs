@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/sqlite-remote-vfs", "crates/sqlite-remote-harness", "crates/sqlite-remote-protocol"]
+members = [
+    "crates/sqlite-remote-vfs",
+    "crates/sqlite-remote-vfs-ffi",
+    "crates/sqlite-remote-vfs-ext",
+    "crates/sqlite-remote-harness",
+    "crates/sqlite-remote-protocol",
+]
 exclude = ["vendor"]
 resolver = "3"
 

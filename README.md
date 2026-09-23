@@ -89,6 +89,49 @@ lease takeover. `vfs.stats()` returns counters for commits, fetches, the local c
 
 `browser/` builds SQLite with SQLite3 Multiple Ciphers for the browser and contains the browser tests.
 
+## Other languages
+
+`sqlite-remote-vfs-ext` builds the VFS as a loadable SQLite extension with a C interface. It contains no SQLite: it
+uses the SQLite that loads it, whether plain SQLite, SQLite3 Multiple Ciphers, SQLCipher or another build (3.14.0 or
+later, with extension loading enabled). `sqlite-remote-vfs-ffi` builds the same interface as a static library for
+programs that link SQLite themselves.
+
+```sh
+cargo build --release -p sqlite-remote-vfs-ext   # target/release/libsqlite_remote_vfs_ext.so or .dylib
+cargo build --release -p sqlite-remote-vfs-ffi   # target/release/libsqlite_remote_vfs_ffi.a
+```
+
+The interface is declared in `crates/sqlite-remote-vfs-ffi/include/sqlite_remote_vfs.h`:
+
+1. Load the extension with `sqlite3_load_extension()` or `load_extension()`. With the static library, skip this step.
+2. Call `sqlite_remote_vfs_register()` with a name and a configuration: URL, public key and a sign function. With the
+   extension, call it from the loaded library: link against it or look it up with `dlsym`. The private key stays in
+   the calling program; the sign function is called at every login.
+3. Open databases through the VFS name, or through `multipleciphers-<name>` with SQLite3 Multiple Ciphers.
+
+A program that links the static library also links SQLite and the system libraries that
+`cargo rustc -p sqlite-remote-vfs-ffi --crate-type staticlib -- --print native-static-libs` lists.
+
+```c
+sqlite_remote_vfs_config config = {
+    .struct_size = sizeof config,
+    .url = "wss://vfs.example/v1/ws",
+    .algorithm = SQLITE_REMOTE_VFS_ED25519,
+    .public_key = public_key,
+    .public_key_len = 32,
+    .sign = sign,              /* signs with the application's Ed25519 key */
+    .sign_context = key,
+};
+char *error = NULL;
+if (sqlite_remote_vfs_register("remote", &config, &error) != SQLITE_OK) {
+    fprintf(stderr, "%s\n", error);
+    sqlite_remote_vfs_free(error);
+}
+sqlite3_open_v2("app.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "remote");
+```
+
+`examples/python/remote_vfs.py` does the same from Python with the `sqlite3` and `ctypes` modules.
+
 ## How it works
 
 The server stores the main database file as numbered blocks of the page size, plus a version number per database
@@ -109,6 +152,7 @@ A server implementation is not part of this repository.
 - CI runs the tests that need no server natively on Linux and macOS and in Firefox, Chrome, Edge and Safari. The
   tests against a server have so far run only locally: natively on macOS and in Firefox and Chrome. Not yet tested
   on Windows.
+- The extension and the static library are tested on Linux and macOS, not yet on Windows.
 
 ## Layout
 
@@ -118,8 +162,12 @@ A server implementation is not part of this repository.
 | `proto/testdata/v1/` | one encoded sample of every message |
 | `crates/sqlite-remote-protocol` | Rust types for the protocol (prost, protox) and the test that writes and checks the samples |
 | `crates/sqlite-remote-vfs` | the VFS. `tests/remote.rs` runs against a server, `tests/tls.rs` over `wss://` through a TLS terminator started by the test, `tests/spike.rs` checks SQLite's VFS behaviour with an in-memory VFS |
+| `crates/sqlite-remote-vfs-ffi` | C interface and header, built as a static library |
+| `crates/sqlite-remote-vfs-ext` | the loadable extension: the C interface plus the entry point, using the SQLite that loads it |
 | `crates/sqlite-remote-harness` | test tool: crash test, fault injection, measurements, latency proxy, load test |
 | `browser/` | separate workspace for `wasm32-unknown-unknown` with the browser tests, see `browser/README.md` |
+| `extension/` | separate workspace that tests the extension and the static library with plain SQLite |
+| `examples/python/` | the extension used from Python |
 | `sqlcipher/` | separate workspace that tests the VFS with SQLCipher instead of SQLite3 Multiple Ciphers |
 | `vendor/libsqlite3-sys` | libsqlite3-sys 0.36.0 with SQLite3 Multiple Ciphers for native builds, see `vendor/libsqlite3-sys/sqlite3mc/README.md` |
 
@@ -140,6 +188,13 @@ links exactly one SQLite. They build SQLCipher and OpenSSL from source:
 
 ```sh
 cd sqlcipher && cargo test          # with SQLITE_REMOTE_TEST_URL also against a server
+```
+
+The tests of the extension and the static library are a separate workspace too, with plain SQLite. They load the
+extension from `target/debug`:
+
+```sh
+cargo build -p sqlite-remote-vfs-ext && (cd extension && cargo test)
 ```
 
 The tests in `remote.rs` and `tls.rs` need a running server and are skipped without `SQLITE_REMOTE_TEST_URL`. They

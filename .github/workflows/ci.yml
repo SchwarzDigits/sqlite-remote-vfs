@@ -42,6 +42,36 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  extension:
+    name: Extension (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            . -> target
+            extension -> target
+      # The tests load the extension from target/debug.
+      - name: Build the extension
+        run: cargo build -p sqlite-remote-vfs-ext
+      - name: Format
+        working-directory: extension
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: extension
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test
+        working-directory: extension
+        run: cargo test
+
   sqlcipher:
     name: SQLCipher (Linux)
     runs-on: ubuntu-latest
