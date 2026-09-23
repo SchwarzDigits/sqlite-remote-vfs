@@ -1,0 +1,18 @@
+[package]
+name = "sqlite-remote-vfs-sqlcipher"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "Tests of sqlite-remote-vfs with SQLCipher instead of SQLite3 Multiple Ciphers"
+
+# A workspace of its own: a build links exactly one SQLite, and the main workspace patches libsqlite3-sys to
+# SQLite3 Multiple Ciphers.
+[workspace]
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", default-features = false }
+getrandom = "0.3"
+# SQLCipher, built together with OpenSSL, so no system OpenSSL is needed.
+rusqlite = { version = "0.38", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+sqlite-remote-vfs = { path = "../crates/sqlite-remote-vfs" }

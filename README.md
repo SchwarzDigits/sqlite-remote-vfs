@@ -3,8 +3,8 @@
 [![CI](https://github.com/SchwarzDigits/sqlite-remote-vfs/actions/workflows/ci.yml/badge.svg)](https://github.com/SchwarzDigits/sqlite-remote-vfs/actions/workflows/ci.yml)
 
 A SQLite VFS that stores the database file on a remote server instead of the local disk. SQLite runs unchanged in
-the client process. A commit returns only after the server has stored it. With SQLite3 Multiple Ciphers on top, the
-server stores only encrypted pages.
+the client process. A commit returns only after the server has stored it. With encryption above the VFS, such as
+SQLite3 Multiple Ciphers or SQLCipher, the server stores only encrypted pages.
 
 Runs natively and in the browser (`wasm32-unknown-unknown`).
 
@@ -15,8 +15,10 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
 - **Durable commits.** At `SQLITE_FCNTL_SYNC` the VFS sends all blocks changed by the transaction to the server and
   waits for the acknowledgement. The server applies a commit atomically. After a connection loss the VFS reconnects
   and checks whether the last commit was applied before it sends the commit again.
-- **Encryption.** Databases opened through `RemoteVfs::encrypted_name()` are encrypted by SQLite3 Multiple Ciphers
-  before the pages reach the VFS. The server never receives plaintext or the database key.
+- **Encryption above the VFS.** The VFS itself does not encrypt and depends on no encryption library. Encryption that
+  runs above it keeps plaintext and the database key away from the server. Tested with SQLite3 Multiple Ciphers
+  (open through `RemoteVfs::encrypted_name()`) and SQLCipher (open through `RemoteVfs::name()`), in both cases with
+  `PRAGMA key`. With plain SQLite the server stores plaintext.
 - **Login by signature.** The application passes a `Signer`: an algorithm, a public key and a sign function. The
   server sends a challenge, verifies the signature and derives the client's subject from the public key. A client
   can only open databases under its own subject. The VFS holds no key material. Supported algorithm: Ed25519.
@@ -70,6 +72,8 @@ conn.pragma_update(None, "key", database_key)?;
 // From here on, use SQLite as usual.
 ```
 
+The example uses SQLite3 Multiple Ciphers. With SQLCipher, open through `vfs.name()` instead.
+
 `Config` also sets the page size (default 4096), the local copy, the memory limit, the loading mode, timeouts and
 lease takeover. `vfs.stats()` returns counters for commits, fetches, the local copy and evictions.
 
@@ -116,6 +120,7 @@ A server implementation is not part of this repository.
 | `crates/sqlite-remote-vfs` | the VFS. `tests/remote.rs` runs against a server, `tests/tls.rs` over `wss://` through a TLS terminator started by the test, `tests/spike.rs` checks SQLite's VFS behaviour with an in-memory VFS |
 | `crates/sqlite-remote-harness` | test tool: crash test, fault injection, measurements, latency proxy, load test |
 | `browser/` | separate workspace for `wasm32-unknown-unknown` with the browser tests, see `browser/README.md` |
+| `sqlcipher/` | separate workspace that tests the VFS with SQLCipher instead of SQLite3 Multiple Ciphers |
 | `vendor/libsqlite3-sys` | libsqlite3-sys 0.36.0 with SQLite3 Multiple Ciphers for native builds, see `vendor/libsqlite3-sys/sqlite3mc/README.md` |
 
 ## Build and test
@@ -128,6 +133,13 @@ cargo test
 cargo test --test spike -- --nocapture                               # also prints the recorded VFS calls
 SQLITE_REMOTE_UPDATE_GOLDEN=1 cargo test -p sqlite-remote-protocol    # rewrites proto/testdata after a protocol change
 SQLITE_REMOTE_TEST_URL=ws://localhost:8080/v1/ws cargo test -p sqlite-remote-vfs --test remote --test tls
+```
+
+The native tests use SQLite3 Multiple Ciphers. The tests with SQLCipher are a separate workspace, because one build
+links exactly one SQLite. They build SQLCipher and OpenSSL from source:
+
+```sh
+cd sqlcipher && cargo test          # with SQLITE_REMOTE_TEST_URL also against a server
 ```
 
 The tests in `remote.rs` and `tls.rs` need a running server and are skipped without `SQLITE_REMOTE_TEST_URL`. They

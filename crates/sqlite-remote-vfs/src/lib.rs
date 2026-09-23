@@ -5,8 +5,9 @@
 //! the sync fails and SQLite rolls the transaction back, as on a failing disk. A commit that returned successfully is
 //! stored on the server.
 //!
-//! Databases opened through [`RemoteVfs::encrypted_name`] (`multipleciphers-<name>`) are encrypted by SQLite3
-//! Multiple Ciphers above the VFS. The server then stores only ciphertext.
+//! The VFS does not encrypt. Encryption above it keeps plaintext away from the server: with SQLite3 Multiple Ciphers,
+//! open databases through [`RemoteVfs::encrypted_name`] (`multipleciphers-<name>`); with SQLCipher, through
+//! [`RemoteVfs::name`]. In both cases the key is set with `PRAGMA key`.
 //!
 //! The client logs in with a [`Signer`]: it signs the server's challenge, and the server derives the subject that owns
 //! the databases from the public key. The client cannot choose the subject.
@@ -181,8 +182,8 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// A registered remote VFS. Open databases through [`RemoteVfs::encrypted_name`] to encrypt them with SQLite3
-/// Multiple Ciphers, or through [`RemoteVfs::name`] without encryption.
+/// A registered remote VFS. With SQLite3 Multiple Ciphers, open databases through [`RemoteVfs::encrypted_name`].
+/// Otherwise open them through [`RemoteVfs::name`]: unencrypted with plain SQLite, encrypted with SQLCipher.
 pub struct RemoteVfs {
     name: String,
     inner: Arc<Inner>,
@@ -269,12 +270,13 @@ impl RemoteVfs {
         })
     }
 
-    /// Name of the VFS in SQLite, without encryption.
+    /// Name of the VFS in SQLite. SQLite itself does not encrypt; SQLCipher encrypts databases opened with this name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    /// Name to open databases with so that SQLite3 Multiple Ciphers encrypts them above this VFS.
+    /// Name of the encrypting VFS that SQLite3 Multiple Ciphers creates above this VFS on first use. Works only if
+    /// the linked SQLite is SQLite3 Multiple Ciphers.
     pub fn encrypted_name(&self) -> String {
         format!("multipleciphers-{}", self.name)
     }
