@@ -17,6 +17,11 @@
 //!
 //! Current limits: one database per registered VFS, one connection per database.
 
+// The unit tests link SQLite from the dev-dependency. The MSVC linker requires every SQLite function that rsqlite-vfs
+// declares, also when no test calls it.
+#[cfg(test)]
+use libsqlite3_sys as _;
+
 mod client;
 mod database;
 mod identity;

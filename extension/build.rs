@@ -7,8 +7,9 @@ fn main() {
         .file("c/layout.c")
         .include("../crates/sqlite-remote-vfs-ffi/include")
         .flag_if_supported("-std=c99")
-        .flag_if_supported("-Wall")
-        .flag_if_supported("-Wextra")
+        // -Wall -Wextra with GCC and Clang, -W4 with MSVC. MSVC's -Wall also reports struct padding.
+        .warnings(true)
+        .extra_warnings(true)
         .flag_if_supported("-Wpedantic")
         .warnings_into_errors(true)
         .compile("layout");

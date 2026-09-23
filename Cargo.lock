@@ -1285,6 +1285,7 @@ dependencies = [
 name = "sqlite-remote-vfs-ffi"
 version = "0.1.0"
 dependencies = [
+ "libsqlite3-sys",
  "sqlite-remote-vfs",
 ]
 

@@ -12,6 +12,11 @@ use std::time::Duration;
 
 use sqlite_remote_vfs::{Algorithm, Config, Load, Local, Memory, RemoteVfs, Signer};
 
+// The unit test binary links SQLite from the dev-dependency. The MSVC linker requires every SQLite function that
+// rsqlite-vfs declares, also when no test calls it.
+#[cfg(test)]
+use libsqlite3_sys as _;
+
 /// `SQLITE_REMOTE_VFS_ED25519` in the header.
 pub const ED25519: c_int = 1;
 
