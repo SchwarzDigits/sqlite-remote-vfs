@@ -1,0 +1,4 @@
+# LF on every platform: rustfmt.toml requires Unix line endings, also in a Windows checkout.
+* text=auto eol=lf
+# Golden files are compared byte for byte.
+*.binpb binary
