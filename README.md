@@ -102,7 +102,9 @@ A server implementation is not part of this repository.
 - One database per registered VFS, one connection per database.
 - Recovery after the server was restored from a backup: a client that has seen commits the restored server no
   longer has is not handled yet. The protocol reserves a field number for it.
-- Tested on macOS, in Firefox and in Chrome. Not yet on Linux, on Windows or in Safari.
+- CI runs the tests that need no server natively on Linux and macOS and in Firefox, Chrome, Edge and Safari. The
+  tests against a server have so far run only locally: natively on macOS and in Firefox and Chrome. Not yet tested
+  on Windows.
 
 ## Layout
 
