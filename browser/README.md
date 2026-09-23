@@ -43,22 +43,25 @@ Variables for `measure.rs`, all read at compile time:
 | `SQLITE_REMOTE_TEST_ROWS` | 500 | rows written for the commit measurement. Use fewer against a server with real latency, e.g. 60 |
 | `SQLITE_REMOTE_TEST_BIG_ROWS` | 2000 | rows written for the reopening measurement over the slow line |
 
-To see the tables, pass `-- --nocapture`:
+Arguments after `--` go to `cargo test`, and arguments after a second `--` go to the tests. To see the tables:
 
 ```sh
-SQLITE_REMOTE_TEST_URL=ws://127.0.0.1:8080/v1/ws ./test.sh --firefox -- --nocapture
+SQLITE_REMOTE_TEST_URL=ws://127.0.0.1:8080/v1/ws ./test.sh --firefox -- --test measure -- --nocapture
 ```
 
 **Timeout.** `test.sh` sets `WASM_BINDGEN_TEST_TIMEOUT` to 180 s unless it is already set. The measurement tests take
 longer than the runner's default of 20 s, in Firefox much longer, because its IndexedDB is slower.
 
-**Chrome.** wasm-pack downloads its own chromedriver and ignores `CHROMEDRIVER`. If that chromedriver does not match
-the installed Chrome, set `CHROMEDRIVER` to a matching one. `test.sh` then calls the test runner directly. The runner
-is installed by the first `./test.sh` run with Firefox.
+**Drivers.** wasm-pack downloads its own chromedriver and ignores `CHROMEDRIVER`, and that chromedriver can be a
+version ahead of the installed Chrome. With `CHROMEDRIVER` (for `--chrome`) or `GECKODRIVER` (for `--firefox`) set,
+`test.sh` does not use wasm-pack and runs the tests with `wasm-bindgen-test-runner` and that driver. It takes the
+runner from `PATH` or from wasm-pack's cache. The runner's version must match the `wasm-bindgen` version in
+`Cargo.lock`.
 
 **llvm-ar.** SQLite's C code is compiled to WebAssembly and packed into a static archive. The macOS system `ar` cannot
-index WebAssembly objects, so the linker finds no symbols in the archive. `test.sh` looks for `llvm-ar` in `PATH` and
-in Homebrew's LLVM. To use another one, set `AR_wasm32_unknown_unknown`.
+index WebAssembly objects, so the linker finds no symbols in the archive. `test.sh` looks for `llvm-ar` in `PATH`,
+also under a versioned name such as `llvm-ar-18`, and in Homebrew's LLVM. To use another one, set
+`AR_wasm32_unknown_unknown`.
 
 ## Differences from the native build
 

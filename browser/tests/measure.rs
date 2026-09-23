@@ -1,8 +1,8 @@
 //! Measurements of the local copy and the memory limit in the browser. The results are printed as Markdown tables.
-//! Run with `-- --nocapture` to see them:
+//! To see them, run only this file and pass `--nocapture` to the tests:
 //!
 //! ```text
-//! CHROMEDRIVER=… SQLITE_REMOTE_TEST_URL=ws://127.0.0.1:18090/v1/ws ./test.sh --chrome -- --nocapture
+//! SQLITE_REMOTE_TEST_URL=ws://127.0.0.1:18090/v1/ws ./test.sh --chrome -- --test measure -- --nocapture
 //! ```
 
 #![cfg(target_arch = "wasm32")]

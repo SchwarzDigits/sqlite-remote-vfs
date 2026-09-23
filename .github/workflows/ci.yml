@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A newer push to the same branch or pull request cancels the older run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Tests that need a page server skip themselves without SQLITE_REMOTE_TEST_URL. No server runs here.
+jobs:
+  native:
+    name: Native (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  browser:
+    name: Browser (Firefox, Chrome)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: browser
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: browser -> target
+      # Must match the wasm-bindgen version in browser/Cargo.lock.
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: wasm-bindgen@0.2.128
+      # The runner image has llvm-ar only under a versioned name.
+      - name: Find llvm-ar
+        run: |
+          name=$(compgen -c llvm-ar | grep -E '^llvm-ar(-[0-9]+)?$' | sort -t- -k3 -n | tail -1)
+          echo "AR_wasm32_unknown_unknown=$(command -v "$name")" >> "$GITHUB_ENV"
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+      # The runner image provides drivers that match its browsers.
+      - name: Test in Firefox
+        run: GECKODRIVER="$GECKOWEBDRIVER/geckodriver" ./test.sh --firefox
+      - name: Test in Chrome
+        run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" ./test.sh --chrome

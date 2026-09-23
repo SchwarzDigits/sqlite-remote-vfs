@@ -1,5 +1,7 @@
 # sqlite-remote-vfs
 
+[![CI](https://github.com/SchwarzDigits/sqlite-remote-vfs/actions/workflows/ci.yml/badge.svg)](https://github.com/SchwarzDigits/sqlite-remote-vfs/actions/workflows/ci.yml)
+
 A SQLite VFS that stores the database file on a remote server instead of the local disk. SQLite runs unchanged in
 the client process. A commit returns only after the server has stored it. With SQLite3 Multiple Ciphers on top, the
 server stores only encrypted pages.
