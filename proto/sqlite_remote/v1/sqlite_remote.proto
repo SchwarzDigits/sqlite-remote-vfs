@@ -1,0 +1,311 @@
+// Protocol between the VFS client and the page server. Each message is one binary WebSocket frame.
+//
+// Covers login, opening a database, fetching blocks, committing, leases and fencing, and catching up a local copy.
+// Recovery after the server was restored from a backup is not defined yet. Field 14 of `ClientFrame` is reserved
+// for it.
+
+syntax = "proto3";
+
+package sqlite_remote.v1;
+
+// A frame from the client to the server.
+message ClientFrame {
+  // Chosen by the client. Must be greater than 0. Every answer to the request carries the same id.
+  uint64 request_id = 1;
+
+  // 14 is reserved for recovery after a server restore.
+  oneof body {
+    Hello hello = 10;
+    Open open = 11;
+    Fetch fetch = 12;
+    Commit commit = 13;
+    Ping ping = 15;
+    CloseDb close_db = 16;
+    Proof proof = 17;
+    Changed changed = 19;
+  }
+}
+
+// A frame from the server to the client.
+message ServerFrame {
+  // The request_id of the request this frame answers. 0 for a frame the server sends unprompted (`LeaseRevoked`).
+  uint64 request_id = 1;
+
+  oneof body {
+    HelloOk hello_ok = 10;
+    Opened opened = 11;
+    Pages pages = 12;
+    CommitAck commit_ack = 13;
+    Pong pong = 14;
+    LeaseRevoked lease_revoked = 15;
+    Error error = 16;
+    Ok ok = 17;
+    Challenge challenge = 18;
+    Changes changes = 19;
+  }
+}
+
+// First frame on a connection. The server answers with a `Challenge`, or with an `Error` if the frame is invalid.
+message Hello {
+  // Protocol version of the client. The server rejects a version other than its own with ERROR_CODE_BAD_REQUEST.
+  uint32 protocol_version = 1;
+  // Random id of the client instance, e.g. one browser tab or worker. 1 to 64 bytes.
+  bytes instance_id = 2;
+  // Algorithm and public key of the client's key pair. The client proves possession of the private key with a
+  // `Proof`. The server derives the subject from the public key. The subject determines which databases the
+  // connection can access. A client has no other way to select a subject.
+  SigAlg sig_alg = 3;
+  bytes public_key = 4;
+  // 5 and 6 are reserved for an enrolment token and a second signature algorithm.
+
+  // Previously a subject chosen by the client. Must not be reused: it would let any client claim any subject.
+  reserved 20;
+  reserved "dev_subject";
+}
+
+// Signature algorithm of the client's key pair.
+enum SigAlg {
+  SIG_ALG_UNSPECIFIED = 0;
+  SIG_ALG_ED25519 = 1;
+}
+
+// Answer to `Hello`, with the Hello's request_id. The client answers with a `Proof`.
+message Challenge {
+  // 32 random bytes. Valid for this login only.
+  bytes nonce = 1;
+  // The server's configured identifier, normally its public WebSocket URL, e.g. "wss://vfs.example/v1/ws". It is
+  // part of the signed transcript. A client that compares it with the URL it connected to detects a challenge that
+  // another server relays. Browsers do not expose TLS channel binding, so this is the only binding available.
+  // sqlite-remote-vfs does not compare it; it expects a separate key for each server instead.
+  string server_id = 2;
+  // Deadline for the `Proof`, in milliseconds since the Unix epoch.
+  uint64 expires_at_ms = 3;
+}
+
+// Answer to `Challenge`. The server answers with `HelloOk`, or with an `Error` (ERROR_CODE_UNAUTHENTICATED), both
+// with the Proof's request_id.
+//
+// `signature` is the signature over the following transcript. Each part is preceded by its length as a 4-byte
+// big-endian integer:
+//
+//   "sqlite-remote-auth-v1" || server_id || nonce || instance_id || sig_alg || public_key
+//
+// sig_alg is the enum value as a 4-byte big-endian integer.
+message Proof {
+  bytes signature = 1;
+}
+
+// Answer to a valid `Proof`, with the Proof's request_id. Completes the login and carries the server's limits.
+message HelloOk {
+  // Protocol version of the server.
+  uint32 protocol_version = 1;
+  // Largest frame the server accepts, in bytes. The client splits a commit into parts that fit.
+  uint32 max_frame_bytes = 2;
+  // Interval at which the client sends a `Ping` while it is otherwise idle, in milliseconds.
+  uint32 ping_interval_ms = 3;
+  // Time after the last renewal from which another instance can acquire the lease without `takeover`, in
+  // milliseconds. Commits and pings renew the lease.
+  uint32 lease_ttl_ms = 4;
+}
+
+// Opens a database and acquires its lease, the exclusive right to commit to it. Answered with `Opened`.
+message Open {
+  // Name of the database within the subject. 1 to 128 bytes of UTF-8.
+  string db_id = 1;
+  // Page size of a new database. For an existing database it must be 0 or equal to the database's page size.
+  uint32 page_size = 2;
+  // Creates the database if it does not exist. Without it, a missing database fails with ERROR_CODE_NOT_FOUND.
+  bool create_if_missing = 3;
+  // Acquires the lease even if another instance holds one that has not expired. Without it, the open fails with
+  // ERROR_CODE_LEASE_HELD in that case.
+  bool takeover = 4;
+  // Set only when reopening after a broken connection. Continues the previous lease instead of acquiring a new one.
+  Resume resume = 5;
+}
+
+// The previous lease and state, for reopening after a broken connection.
+message Resume {
+  // lease_id and lease_epoch from the previous `Opened`. If the lease is no longer current, the open fails with
+  // ERROR_CODE_FENCED.
+  bytes lease_id = 1;
+  uint64 lease_epoch = 2;
+  // The last version the server acknowledged to this client.
+  uint64 known_version = 3;
+  // commit_id of a commit that was sent but not acknowledged. Empty if there is none.
+  bytes pending_commit_id = 4;
+}
+
+// Answer to `Open`: the lease and the current state of the database.
+message Opened {
+  bytes lease_id = 1;
+  // Fencing token. Every new lease has a higher epoch. A `Commit` must carry the current epoch, otherwise it fails
+  // with ERROR_CODE_FENCED.
+  uint64 lease_epoch = 2;
+  // Current version. Every applied commit increases it by 1.
+  uint64 version = 3;
+  uint32 page_size = 4;
+  // Length of the database file, in blocks.
+  uint64 page_count = 5;
+  // commit_id of the last applied commit. A client whose commit was not acknowledged compares it with its own
+  // commit_id to find out whether the commit was applied.
+  bytes last_commit_id = 6;
+}
+
+// Requests blocks as of `version`. Either one range (`first_block` and `count`) or several (`ranges`). Answered with
+// one or more `Pages` frames.
+//
+// Several ranges in one request are for catching up a local copy. The blocks changed by a series of commits are
+// spread across the file, and one request per range would cost one round trip each.
+message Fetch {
+  string db_id = 1;
+  // Must be the current version. Otherwise the request fails with ERROR_CODE_VERSION_CONFLICT.
+  uint64 version = 2;
+  // One range: `count` blocks starting at `first_block`. Ignored if `ranges` is set.
+  uint64 first_block = 3;
+  uint64 count = 4;
+  // Several ranges, in ascending order and without overlap. At most 4096. Blocks that were never written are
+  // returned as zeros.
+  repeated Range ranges = 5;
+}
+
+// A range of consecutive blocks.
+message Range {
+  uint64 first_block = 1;
+  uint64 count = 2;
+}
+
+// Blocks answering a `Fetch`, with the Fetch's request_id. The server sends the ranges in the requested order and
+// splits them across as many frames as needed. A frame never contains blocks from two ranges.
+message Pages {
+  // Index of the first block in this frame.
+  uint64 first_block = 1;
+  // Consecutive blocks from `first_block`, each exactly page_size bytes.
+  repeated bytes blocks = 2;
+  // True on the last frame of the answer.
+  bool last = 3;
+}
+
+// Requests the indexes of all blocks changed since `from_version`. Answered with `Changes`.
+//
+// Used to catch up a local copy that is a few commits behind. The client discards those blocks from the copy and
+// keeps the rest, instead of fetching the whole database.
+message Changed {
+  string db_id = 1;
+  // Version of the client's local copy. Must not be greater than the current version.
+  uint64 from_version = 2;
+}
+
+// Answer to `Changed`.
+message Changes {
+  uint64 from_version = 1;
+  // The current version.
+  uint64 to_version = 2;
+  // Indexes of all blocks written by any commit after `from_version`, ascending and without duplicates.
+  repeated uint64 blocks = 3;
+  // False if the server's change log does not reach back to `from_version`, or the list does not fit in one frame.
+  // `blocks` is then empty and the client has to discard its local copy.
+  bool complete = 4;
+}
+
+// One frame (part) of a commit: blocks changed by one or more SQLite transactions. The server applies a commit
+// atomically. Only the last part is answered, with `CommitAck` or `Error`. A refused part is answered with `Error`
+// at once.
+message Commit {
+  string db_id = 1;
+  // 16 random bytes, the same in every part. Makes a repeated commit idempotent: if the last applied commit has this
+  // id and the version is base_version + 1, the server answers with that version again.
+  bytes commit_id = 2;
+  // Current lease epoch, otherwise ERROR_CODE_FENCED.
+  uint64 lease_epoch = 3;
+  // Version the commit is based on. Must be the current version, otherwise ERROR_CODE_VERSION_CONFLICT.
+  uint64 base_version = 4;
+  // Length of the database file after the commit, in blocks. Blocks at or beyond it are removed.
+  uint64 page_count = 5;
+  repeated Block blocks = 6;
+  // True if more parts of this commit follow.
+  bool more = 7;
+  // Number of this part within the commit, starting at 0. Part 0 starts a new commit and discards an incomplete one.
+  // Every further part must directly follow the previous part and repeat its commit_id, lease_epoch, base_version
+  // and page_count. Otherwise the server refuses it and discards the commit, so later parts cannot be applied on
+  // their own. This keeps a commit atomic although the client sends all parts without waiting for answers.
+  uint32 part = 8;
+}
+
+// One block of the database file.
+message Block {
+  // Byte offset in the file divided by page_size.
+  uint64 index = 1;
+  // Exactly page_size bytes.
+  bytes data = 2;
+}
+
+// Answer to the last part of an applied `Commit`. The commit is durable when this is sent.
+message CommitAck {
+  bytes commit_id = 1;
+  // Version after the commit.
+  uint64 version = 2;
+}
+
+// Releases the lease of a database immediately. Answered with `Ok`.
+message CloseDb {
+  string db_id = 1;
+  uint64 lease_epoch = 2;
+}
+
+// Keeps the connection open and renews the leases of all databases open on it. The server renews a lease only if
+// at least half of lease_ttl_ms has passed since its last renewal. Answered with `Pong`.
+message Ping {
+  // Client clock in milliseconds. Returned unchanged in the `Pong`.
+  uint64 client_time_ms = 1;
+}
+
+// Answer to `Ping`.
+message Pong {
+  uint64 client_time_ms = 1;
+}
+
+// Answer to a request that returns no data, e.g. `CloseDb`.
+message Ok {}
+
+// Sent unprompted (request_id 0) when another instance has acquired the lease of a database open on this
+// connection. Delivery is not guaranteed. A client that missed it gets ERROR_CODE_FENCED on its next commit.
+message LeaseRevoked {
+  string db_id = 1;
+  uint64 new_lease_epoch = 2;
+}
+
+// Answer to a failed request.
+message Error {
+  ErrorCode code = 1;
+  // Human-readable reason. For ERROR_CODE_INTERNAL it contains no details.
+  string detail = 2;
+  // Current version of the database. Set with ERROR_CODE_VERSION_CONFLICT.
+  uint64 current_version = 3;
+  // Time the current lease was granted, in milliseconds since the Unix epoch. Set with ERROR_CODE_LEASE_HELD.
+  uint64 lease_holder_since_ms = 4;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  // Login failed: no valid `Proof`, an expired challenge, or a request before the login.
+  ERROR_CODE_UNAUTHENTICATED = 1;
+  // The database belongs to another subject.
+  ERROR_CODE_FORBIDDEN = 2;
+  // The database does not exist.
+  ERROR_CODE_NOT_FOUND = 3;
+  // Another instance holds a lease that has not expired.
+  ERROR_CODE_LEASE_HELD = 4;
+  // The lease epoch is not the current one: another instance acquired the lease, or it was released.
+  ERROR_CODE_FENCED = 5;
+  // The request is based on a version other than the current one. See `Error.current_version`.
+  ERROR_CODE_VERSION_CONFLICT = 6;
+  // The request is invalid and cannot succeed when repeated, e.g. a block of the wrong size, a block index at or
+  // beyond page_count, or a commit part that does not continue the pending commit.
+  ERROR_CODE_BAD_REQUEST = 7;
+  // The commit exceeds the server's size limit for one commit.
+  ERROR_CODE_TOO_LARGE = 8;
+  ERROR_CODE_QUOTA_EXCEEDED = 9;
+  ERROR_CODE_RATE_LIMITED = 10;
+  // Unexpected error on the server. Details are only in the server's log.
+  ERROR_CODE_INTERNAL = 11;
+}

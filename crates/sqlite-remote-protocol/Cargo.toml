@@ -1,0 +1,16 @@
+[package]
+name = "sqlite-remote-protocol"
+version = "0.1.0"
+description = "Protocol messages between the VFS client and the page server"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+prost = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"
+# Compiles the .proto file in Rust, so protoc and buf are not needed.
+protox = "0.9"

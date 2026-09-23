@@ -1,0 +1,40 @@
+[package]
+name = "sqlite-remote-vfs"
+version = "0.1.0"
+description = "SQLite VFS that keeps the database file on a remote page server"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Encodes the subject (SHA-256 over the public key) as base64url.
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+getrandom = "0.3"
+prost = "0.14"
+sqlite-remote-protocol = { version = "0.1.0", path = "../sqlite-remote-protocol" }
+rsqlite-vfs = "0.2"
+sha2 = { version = "0.10", default-features = false }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+# Blocking WebSocket client for native targets. In a browser the connection worker holds the WebSocket.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker"] }
+
+[dev-dependencies]
+# Only the tests create keys and sign. The crate itself only uses the `Signer` it is given.
+ed25519-dalek = { version = "2", default-features = false }
+getrandom = "0.3"
+# SQLite3 Multiple Ciphers instead of plain SQLite, so the tests run with encryption above the VFS.
+libsqlite3-sys = { version = "0.36", default-features = false, features = ["bundled-sqlite3mc"] }
+rcgen = "0.14"
+rusqlite = { version = "0.38", default-features = false, features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

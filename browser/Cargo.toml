@@ -1,0 +1,44 @@
+[package]
+name = "sqlite-remote-vfs-browser"
+version = "0.1.0"
+description = "SQLite with SQLite3 Multiple Ciphers on a Rust VFS, in the browser"
+edition = "2024"
+license = "Apache-2.0"
+rust-version = "1.97"
+publish = false
+
+[dependencies]
+sqlite-remote-vfs = { path = "../crates/sqlite-remote-vfs" }
+getrandom = { version = "0.3", features = ["wasm_js"] }
+js-sys = "0.3"
+rsqlite-vfs = "0.2"
+
+[dev-dependencies]
+# Signer for the tests. The VFS receives a `Signer` and holds no key material itself.
+ed25519-dalek = { version = "2", default-features = false }
+# SQLite for `wasm32-unknown-unknown`, built with SQLite3 Multiple Ciphers. Pinned, because an application that uses
+# this VFS links its own SQLite, and that should be the build the VFS was tested with.
+sqlite-wasm-rs = { version = "0.5.5", features = ["sqlite3mc"] }
+# On this target rusqlite binds to sqlite-wasm-rs instead of libsqlite3-sys. This is why its version differs from
+# the native tests.
+rusqlite = { version = "0.40", default-features = false, features = ["ffi-sqlite-wasm-rs"] }
+wasm-bindgen-futures = "0.4"
+wasm-bindgen-test = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+  "Blob",
+  "BlobPropertyBag",
+  "console",
+  "Performance",
+  "StorageEstimate",
+  "StorageManager",
+  "Url",
+  "MessageEvent",
+  "Worker",
+  "WorkerGlobalScope",
+  "WorkerNavigator",
+] }
+
+# Separate workspace. The native workspace patches libsqlite3-sys to a vendored copy, which this target does not use,
+# and the rusqlite versions differ.
+[workspace]
