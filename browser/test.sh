@@ -29,6 +29,12 @@ if [ -z "${AR_wasm32_unknown_unknown:-}" ]; then
   export AR_wasm32_unknown_unknown
 fi
 
+# Apple's clang has a WebAssembly target only in recent Xcode versions. Use the clang of the same LLVM as llvm-ar.
+if [ -z "${CC_wasm32_unknown_unknown:-}" ] && [ -x "$(dirname "$AR_wasm32_unknown_unknown")/clang" ]; then
+  CC_wasm32_unknown_unknown="$(dirname "$AR_wasm32_unknown_unknown")/clang"
+  export CC_wasm32_unknown_unknown
+fi
+
 # The measurement tests run longer than the test runner's default timeout of 20 s, in Firefox much longer, because
 # its IndexedDB is slower. Default to 180 s instead of reducing the number of samples.
 export WASM_BINDGEN_TEST_TIMEOUT=${WASM_BINDGEN_TEST_TIMEOUT:-180}
@@ -39,6 +45,7 @@ if [ "$#" -gt 0 ]; then
 fi
 
 echo "llvm-ar: $AR_wasm32_unknown_unknown"
+echo "clang: ${CC_wasm32_unknown_unknown:-clang from PATH}"
 
 # Prints the path of wasm-bindgen-test-runner: from PATH, or from the cache where wasm-pack installs it on its first
 # run (macOS and Linux locations). Its version must match the wasm-bindgen version in Cargo.lock.

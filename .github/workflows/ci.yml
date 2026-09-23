@@ -95,7 +95,8 @@ jobs:
       - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
         with:
           tool: wasm-bindgen@0.2.128
-      # The system ar cannot index WebAssembly objects. The runner image has LLVM from Homebrew, possibly versioned.
+      # The system ar cannot index WebAssembly objects, and the runner's Xcode clang has no WebAssembly target. The
+      # image has LLVM from Homebrew, possibly versioned. test.sh takes clang from the same directory as llvm-ar.
       - name: Find llvm-ar
         run: |
           ar=$(ls -d "$(brew --prefix)"/opt/llvm*/bin/llvm-ar 2> /dev/null | tail -1)

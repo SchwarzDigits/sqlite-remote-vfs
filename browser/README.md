@@ -64,10 +64,11 @@ tests with `wasm-bindgen-test-runner` and that driver. It takes the runner from 
 runner's version must match the `wasm-bindgen` version in `Cargo.lock`. CI runs the tests in Firefox, Chrome and Edge
 on Linux and in Safari on macOS.
 
-**llvm-ar.** SQLite's C code is compiled to WebAssembly and packed into a static archive. The macOS system `ar` cannot
-index WebAssembly objects, so the linker finds no symbols in the archive. `test.sh` looks for `llvm-ar` in `PATH`,
-also under a versioned name such as `llvm-ar-18`, and in Homebrew's LLVM. To use another one, set
-`AR_wasm32_unknown_unknown`.
+**LLVM.** SQLite's C code is compiled to WebAssembly and packed into a static archive. The macOS system `ar` cannot
+index WebAssembly objects, so the linker finds no symbols in the archive, and Apple's clang has a WebAssembly target
+only in recent Xcode versions. `test.sh` looks for `llvm-ar` in `PATH`, also under a versioned name such as
+`llvm-ar-18`, and in Homebrew's LLVM, and uses the `clang` from the same directory if there is one. To use others,
+set `AR_wasm32_unknown_unknown` and `CC_wasm32_unknown_unknown`.
 
 ## Differences from the native build
 
