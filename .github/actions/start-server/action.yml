@@ -60,16 +60,23 @@ runs:
         go install "github.com/SchwarzDigits/sqlite-remote-server/cmd/sqlite-remote-server@$env:VERSION"
         if ($LASTEXITCODE -ne 0) { exit 1 }
         $url = "ws://127.0.0.1:$env:PORT/v1/ws"
-        $env:SQLITE_REMOTE_PORT = $env:PORT
-        $env:SQLITE_REMOTE_SERVER_ID = $url
-        $env:SQLITE_REMOTE_STORE = $env:STORE
-        $env:SQLITE_REMOTE_DATABASE_URL = $env:DATABASE_URL
-        $env:SQLITE_REMOTE_ALLOWED_ORIGINS = '127.0.0.1:*,localhost:*'
+        $exe = Join-Path (go env GOPATH) 'bin\sqlite-remote-server.exe'
         $log = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.log'
         $errors = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.err.log'
-        # In a console of its own. With -NoNewWindow, sharing the step's console, the server was gone in the next step.
-        Start-Process -FilePath (Join-Path (go env GOPATH) 'bin\sqlite-remote-server.exe') -WindowStyle Hidden `
-          -RedirectStandardOutput $log -RedirectStandardError $errors
+        $script = Join-Path $env:RUNNER_TEMP 'start-sqlite-remote-server.cmd'
+        @(
+          '@echo off'
+          "set SQLITE_REMOTE_PORT=$env:PORT"
+          "set SQLITE_REMOTE_SERVER_ID=$url"
+          "set SQLITE_REMOTE_STORE=$env:STORE"
+          "set SQLITE_REMOTE_DATABASE_URL=$env:DATABASE_URL"
+          'set SQLITE_REMOTE_ALLOWED_ORIGINS=127.0.0.1:*,localhost:*'
+          "`"$exe`" > `"$log`" 2> `"$errors`""
+        ) | Set-Content -Path $script -Encoding ascii
+        # A process started from this step, also with Start-Process, was gone in the next step. A process that WMI
+        # creates is not a child of the step and keeps running.
+        $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = "cmd.exe /c `"$script`"" }
+        if ($created.ReturnValue -ne 0) { Write-Host "Win32_Process.Create failed: $($created.ReturnValue)"; exit 1 }
         for ($i = 0; $i -lt 100; $i++) {
           curl.exe -sf "http://127.0.0.1:$env:PORT/.well-known/ready" > $null
           if ($LASTEXITCODE -eq 0) {
