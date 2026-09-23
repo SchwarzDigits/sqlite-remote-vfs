@@ -2,8 +2,8 @@
 //! server's test suite decodes the same files and checks that it gets the same messages. This keeps both
 //! implementations on the same wire format.
 //!
-//! After an intended protocol change, run `SQLITE_REMOTE_UPDATE_GOLDEN=1 cargo test -p sqlite-remote-protocol` to
-//! rewrite the files.
+//! After an intended protocol change, first rewrite the generated code (see `tests/generated.rs`), then run
+//! `SQLITE_REMOTE_UPDATE_GOLDEN=1 cargo test -p sqlite-remote-protocol --test golden` to rewrite the files.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;

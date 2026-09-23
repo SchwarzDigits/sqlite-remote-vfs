@@ -161,7 +161,7 @@ in-memory store and a PostgreSQL store.
 |---|---|
 | `proto/sqlite_remote/v1/sqlite_remote.proto` | protocol definition |
 | `proto/testdata/v1/` | one encoded sample of every message |
-| `crates/sqlite-remote-protocol` | Rust types for the protocol (prost, protox) and the test that writes and checks the samples |
+| `crates/sqlite-remote-protocol` | Rust types for the protocol, generated with prost and checked in, and the tests that check them against the `.proto` file and check the samples |
 | `crates/sqlite-remote-vfs` | the VFS. `tests/remote.rs` runs against a server, `tests/tls.rs` over `wss://` through a TLS terminator started by the test, `tests/spike.rs` checks SQLite's VFS behaviour with an in-memory VFS |
 | `crates/sqlite-remote-vfs-ffi` | C interface and header, built as a static library |
 | `crates/sqlite-remote-vfs-ext` | the loadable extension: the C interface plus the entry point, using the SQLite that loads it |
@@ -174,14 +174,22 @@ in-memory store and a PostgreSQL store.
 
 ## Build and test
 
-Requires rustup. `rust-toolchain.toml` pins Rust 1.97.1. `protoc` and `buf` are not needed: `protox` compiles the
-`.proto` file in the build script.
+Requires rustup. `rust-toolchain.toml` pins Rust 1.97.1.
 
 ```sh
 cargo test
-cargo test --test spike -- --nocapture                               # also prints the recorded VFS calls
-SQLITE_REMOTE_UPDATE_GOLDEN=1 cargo test -p sqlite-remote-protocol    # rewrites proto/testdata after a protocol change
+cargo test --test spike -- --nocapture    # also prints the recorded VFS calls
 SQLITE_REMOTE_TEST_URL=ws://localhost:8080/v1/ws cargo test -p sqlite-remote-vfs --test remote --test tls
+```
+
+The Rust code for the protocol is generated with prost and checked in as
+`crates/sqlite-remote-protocol/src/sqlite_remote.v1.rs`, so a build runs no code generator. After a change to the
+`.proto` file, rewrite that code, then the samples in `proto/testdata`. `protox` compiles the `.proto` file in Rust, so
+`protoc` and `buf` are not needed:
+
+```sh
+SQLITE_REMOTE_UPDATE_GENERATED=1 cargo test -p sqlite-remote-protocol --test generated
+SQLITE_REMOTE_UPDATE_GOLDEN=1 cargo test -p sqlite-remote-protocol --test golden
 ```
 
 The native tests use SQLite3 Multiple Ciphers. The tests with SQLCipher are a separate workspace, because one build
