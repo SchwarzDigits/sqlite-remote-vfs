@@ -1,6 +1,7 @@
 // Protocol between the VFS client and the page server. Each message is one binary WebSocket frame.
 //
-// Covers login, opening a database, fetching blocks, committing, leases and fencing, and catching up a local copy.
+// Covers login, opening a database, fetching blocks, committing, leases and fencing, catching up a local copy, and
+// deleting a database.
 // Recovery after the server was restored from a backup is not defined yet. Field 14 of `ClientFrame` is reserved
 // for it.
 
@@ -22,6 +23,7 @@ message ClientFrame {
     Ping ping = 15;
     CloseDb close_db = 16;
     Proof proof = 17;
+    Delete delete = 18;
     Changed changed = 19;
   }
 }
@@ -114,7 +116,8 @@ message Open {
   string db_id = 1;
   // Page size of a new database. For an existing database it must be 0 or equal to the database's page size.
   uint32 page_size = 2;
-  // Creates the database if it does not exist. Without it, a missing database fails with ERROR_CODE_NOT_FOUND.
+  // Creates the database if it does not exist or was deleted. Without it, such a database fails with
+  // ERROR_CODE_NOT_FOUND.
   bool create_if_missing = 3;
   // Acquires the lease even if another instance holds one that has not expired. Without it, the open fails with
   // ERROR_CODE_LEASE_HELD in that case.
@@ -141,7 +144,7 @@ message Opened {
   // Fencing token. Every new lease has a higher epoch. A `Commit` must carry the current epoch, otherwise it fails
   // with ERROR_CODE_FENCED.
   uint64 lease_epoch = 2;
-  // Current version. Every applied commit increases it by 1.
+  // Current version. Every applied commit and every deletion increases it by 1.
   uint64 version = 3;
   uint32 page_size = 4;
   // Length of the database file, in blocks.
@@ -252,6 +255,20 @@ message CloseDb {
   uint64 lease_epoch = 2;
 }
 
+// Deletes a database: its blocks and its change log. Answered with `Ok`, also if the database does not exist or was
+// already deleted, so that a repeated request succeeds.
+//
+// The database must not be open on this connection. The server keeps a record of the deleted database with its lease
+// epoch and version, and increases the epoch, so that no earlier lease can commit again. Opening the database again
+// with `create_if_missing` creates it empty with any page size; the epoch and the version continue from the deleted
+// database. Opening it without `create_if_missing` fails with ERROR_CODE_NOT_FOUND.
+message Delete {
+  string db_id = 1;
+  // Deletes even if another instance holds a lease that has not expired. That instance receives `LeaseRevoked`.
+  // Without it, the request fails with ERROR_CODE_LEASE_HELD in that case.
+  bool takeover = 2;
+}
+
 // Keeps the connection open and renews the leases of all databases open on it. The server renews a lease only if
 // at least half of lease_ttl_ms has passed since its last renewal. Answered with `Pong`.
 message Ping {
@@ -291,7 +308,7 @@ enum ErrorCode {
   ERROR_CODE_UNAUTHENTICATED = 1;
   // The database belongs to another subject.
   ERROR_CODE_FORBIDDEN = 2;
-  // The database does not exist.
+  // The database does not exist or was deleted.
   ERROR_CODE_NOT_FOUND = 3;
   // Another instance holds a lease that has not expired.
   ERROR_CODE_LEASE_HELD = 4;

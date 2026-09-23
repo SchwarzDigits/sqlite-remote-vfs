@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 use prost::Message;
 use sqlite_remote_protocol::v1::{
-    Block, Challenge, Changed, Changes, ClientFrame, CloseDb, Commit, CommitAck, Error, ErrorCode, Fetch, Hello,
-    HelloOk, LeaseRevoked, Ok, Open, Opened, Pages, Ping, Pong, Proof, Range, Resume, ServerFrame, SigAlg,
+    Block, Challenge, Changed, Changes, ClientFrame, CloseDb, Commit, CommitAck, Delete, Error, ErrorCode, Fetch,
+    Hello, HelloOk, LeaseRevoked, Ok, Open, Opened, Pages, Ping, Pong, Proof, Range, Resume, ServerFrame, SigAlg,
     client_frame, server_frame,
 };
 
@@ -287,6 +287,16 @@ fn samples() -> Vec<(&'static str, Frame)> {
             ),
         ),
         ("server_ok", server(6, S::Ok(Ok {}))),
+        (
+            "client_delete",
+            client(
+                7,
+                C::Delete(Delete {
+                    db_id: DB_ID.into(),
+                    takeover: true,
+                }),
+            ),
+        ),
         (
             "server_lease_revoked",
             server(
