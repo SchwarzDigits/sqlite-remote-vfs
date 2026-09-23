@@ -48,6 +48,12 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Server log
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-Process sqlite-remote-server -ErrorAction SilentlyContinue
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'sqlite-remote-server*.log') | ForEach-Object { "== $_"; Get-Content $_ }
 
   postgres:
     name: End-to-end with PostgreSQL (Linux)
@@ -115,6 +121,12 @@ jobs:
       - name: Test
         working-directory: extension
         run: cargo test
+      - name: Server log
+        if: failure()
+        shell: pwsh
+        run: |
+          Get-Process sqlite-remote-server -ErrorAction SilentlyContinue
+          Get-ChildItem (Join-Path $env:RUNNER_TEMP 'sqlite-remote-server*.log') | ForEach-Object { "== $_"; Get-Content $_ }
 
   sqlcipher:
     name: SQLCipher (Linux)
