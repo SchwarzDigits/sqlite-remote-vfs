@@ -322,6 +322,9 @@ async fn delete_removes_database_and_indexeddb_copy() {
         .expect("create");
     conn.execute("INSERT INTO t VALUES (1, 'row')", []).expect("insert");
     drop(conn);
+    // The connection worker writes the local copy asynchronously. Opening the database once more reads the copy,
+    // which waits for the pending writes, so afterwards the copy exists in IndexedDB.
+    drop(open(&vfs));
     let names = common::indexed_databases().await.expect("list IndexedDB databases");
     assert!(
         names.contains(&copy_name),
