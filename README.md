@@ -154,10 +154,6 @@ in-memory store and a PostgreSQL store.
 - One database per registered VFS, one connection per database.
 - Recovery after the server was restored from a backup: a client that has seen commits the restored server no
   longer has is not handled yet. The protocol reserves a field number for it.
-- CI runs all tests against [sqlite-remote-server](https://github.com/SchwarzDigits/sqlite-remote-server):
-  natively on Linux and macOS, against PostgreSQL on Linux, and in Firefox, Chrome, Edge and Safari. Not yet tested
-  on Windows.
-- The extension and the static library are tested on Linux and macOS, not yet on Windows.
 
 ## Layout
 
@@ -207,6 +203,10 @@ The tests in `remote.rs` and `tls.rs` need a running
 `SQLITE_REMOTE_TEST_URL`. The server's `SQLITE_REMOTE_SERVER_ID` must equal that URL. The tests log in with random
 keys. The TLS tests create their own CA and certificates and start a TLS terminator in front of
 the server, so no system configuration is needed.
+
+CI runs all tests against the server. The native tests and those of the extension and the static library run on
+Linux, macOS and Windows, the tests against PostgreSQL and with SQLCipher on Linux, and the browser tests in Firefox,
+Chrome, Edge and Safari.
 
 ## Harness
 
