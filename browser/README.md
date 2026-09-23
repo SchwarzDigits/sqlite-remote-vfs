@@ -22,9 +22,14 @@ WebAssembly with SQLite3 Multiple Ciphers.
 ## Running
 
 ```sh
-./test.sh              # headless Firefox
-./test.sh --chrome     # any browser flag of wasm-pack
+./test.sh                                              # headless Firefox
+./test.sh --chrome                                     # headless Chrome
+SAFARIDRIVER=/usr/bin/safaridriver ./test.sh --safari  # Safari, in a window
+MSEDGEDRIVER=/path/to/msedgedriver ./test.sh --edge    # headless Edge
 ```
+
+Safari accepts WebDriver sessions only after remote automation is enabled once with `sudo safaridriver --enable`.
+Safari has no headless mode.
 
 The tests that need a server read its URL at compile time. Without `SQLITE_REMOTE_TEST_URL` they return immediately
 and pass.
@@ -52,11 +57,12 @@ SQLITE_REMOTE_TEST_URL=ws://127.0.0.1:8080/v1/ws ./test.sh --firefox -- --test m
 **Timeout.** `test.sh` sets `WASM_BINDGEN_TEST_TIMEOUT` to 180 s unless it is already set. The measurement tests take
 longer than the runner's default of 20 s, in Firefox much longer, because its IndexedDB is slower.
 
-**Drivers.** wasm-pack downloads its own chromedriver and ignores `CHROMEDRIVER`, and that chromedriver can be a
-version ahead of the installed Chrome. With `CHROMEDRIVER` (for `--chrome`) or `GECKODRIVER` (for `--firefox`) set,
-`test.sh` does not use wasm-pack and runs the tests with `wasm-bindgen-test-runner` and that driver. It takes the
-runner from `PATH` or from wasm-pack's cache. The runner's version must match the `wasm-bindgen` version in
-`Cargo.lock`.
+**Drivers.** wasm-pack downloads its own chromedriver and ignores `CHROMEDRIVER`, that chromedriver can be a version
+ahead of the installed Chrome, and wasm-pack does not support Edge. If the driver variable of the chosen browser is
+set (`GECKODRIVER`, `CHROMEDRIVER`, `SAFARIDRIVER` or `MSEDGEDRIVER`), `test.sh` does not use wasm-pack and runs the
+tests with `wasm-bindgen-test-runner` and that driver. It takes the runner from `PATH` or from wasm-pack's cache. The
+runner's version must match the `wasm-bindgen` version in `Cargo.lock`. CI runs the tests in Firefox, Chrome and Edge
+on Linux and in Safari on macOS.
 
 **llvm-ar.** SQLite's C code is compiled to WebAssembly and packed into a static archive. The macOS system `ar` cannot
 index WebAssembly objects, so the linker finds no symbols in the archive. `test.sh` looks for `llvm-ar` in `PATH`,

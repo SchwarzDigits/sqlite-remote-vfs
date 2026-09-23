@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Runs the browser tests in headless Firefox. Arguments replace `--firefox` and are passed to `wasm-pack test`,
-# e.g. `./test.sh --chrome`.
+# e.g. `./test.sh --chrome` or `./test.sh --safari`.
 #
-# With GECKODRIVER (for --firefox) or CHROMEDRIVER (for --chrome) set, the script does not use wasm-pack. It runs the
-# tests with wasm-bindgen-test-runner and that driver. wasm-pack downloads its own drivers and ignores these
-# variables, and its chromedriver can be a version ahead of the installed Chrome.
+# If the driver variable of the chosen browser is set, the script does not use wasm-pack. It runs the tests with
+# wasm-bindgen-test-runner and that driver: GECKODRIVER for --firefox, CHROMEDRIVER for --chrome, SAFARIDRIVER for
+# --safari, MSEDGEDRIVER for --edge. wasm-pack downloads its own drivers and ignores these variables, its chromedriver
+# can be a version ahead of the installed Chrome, and it does not support Edge.
 #
 # SQLite's C code is compiled to WebAssembly and packed into a static archive. The macOS system `ar` cannot index
 # WebAssembly objects ("not a mach-o file"), so the linker finds no symbols in the archive. `llvm-ar` is required.
@@ -53,11 +54,20 @@ find_runner() {
   done | head -1
 }
 
-driver=""
 case "${browser[0]}" in
-  --firefox) [ -n "${GECKODRIVER:-}" ] && driver=GECKODRIVER ;;
-  --chrome) [ -n "${CHROMEDRIVER:-}" ] && driver=CHROMEDRIVER ;;
+  --firefox) driver=GECKODRIVER ;;
+  --chrome) driver=CHROMEDRIVER ;;
+  --safari) driver=SAFARIDRIVER ;;
+  --edge) driver=MSEDGEDRIVER ;;
+  *) driver="" ;;
 esac
+if [ -n "$driver" ] && [ -z "${!driver:-}" ]; then
+  if [ "$driver" = MSEDGEDRIVER ]; then
+    echo "--edge needs MSEDGEDRIVER set to msedgedriver: wasm-pack does not support Edge" >&2
+    exit 1
+  fi
+  driver=""
+fi
 
 if [ -n "$driver" ]; then
   runner=$(find_runner)
@@ -68,9 +78,12 @@ if [ -n "$driver" ]; then
   fi
   echo "$driver: ${!driver}"
   echo "runner: $runner"
-  # The runner chooses the browser by the first driver variable that is set, so only the chosen one may be set.
-  if [ "$driver" = GECKODRIVER ]; then unset CHROMEDRIVER; else unset GECKODRIVER; fi
-  unset SAFARIDRIVER MSEDGEDRIVER
+  # The runner chooses the browser by the first driver variable that is set, and a `*_REMOTE` variable takes
+  # precedence over all of them. Only the chosen driver variable may be set.
+  for other in GECKODRIVER SAFARIDRIVER CHROMEDRIVER MSEDGEDRIVER; do
+    [ "$other" = "$driver" ] || unset "$other"
+    unset "${other}_REMOTE"
+  done
   export CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$runner" WASM_BINDGEN_TEST_ONLY_WEB=1
   # As with `wasm-pack test`, arguments after `--` go to `cargo test`.
   extra=("${browser[@]:1}")

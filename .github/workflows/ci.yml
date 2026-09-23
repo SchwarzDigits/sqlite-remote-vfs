@@ -43,7 +43,7 @@ jobs:
           RUSTDOCFLAGS: -D warnings
 
   browser:
-    name: Browser (Firefox, Chrome)
+    name: Browser (Firefox, Chrome, Edge)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     defaults:
@@ -74,3 +74,38 @@ jobs:
         run: GECKODRIVER="$GECKOWEBDRIVER/geckodriver" ./test.sh --firefox
       - name: Test in Chrome
         run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" ./test.sh --chrome
+      - name: Test in Edge
+        run: MSEDGEDRIVER="$EDGEWEBDRIVER/msedgedriver" ./test.sh --edge
+
+  safari:
+    name: Browser (Safari)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: browser
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: browser -> target
+      # Must match the wasm-bindgen version in browser/Cargo.lock.
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: wasm-bindgen@0.2.128
+      # The system ar cannot index WebAssembly objects. The runner image has LLVM from Homebrew, possibly versioned.
+      - name: Find llvm-ar
+        run: |
+          ar=$(ls -d "$(brew --prefix)"/opt/llvm*/bin/llvm-ar 2> /dev/null | tail -1)
+          if [ -z "$ar" ]; then
+            brew install llvm
+            ar="$(brew --prefix llvm)/bin/llvm-ar"
+          fi
+          echo "AR_wasm32_unknown_unknown=$ar" >> "$GITHUB_ENV"
+      # Safari only accepts WebDriver sessions after remote automation is enabled. It has no headless mode.
+      - name: Enable Safari's WebDriver
+        run: sudo safaridriver --enable
+      - name: Test in Safari
+        run: SAFARIDRIVER=/usr/bin/safaridriver ./test.sh --safari
