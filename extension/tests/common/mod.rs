@@ -104,6 +104,8 @@ impl Login {
 pub type RegisterFn = unsafe extern "C" fn(*const c_char, *const SqliteRemoteVfsConfig, *mut *mut c_char) -> c_int;
 /// Signature of `sqlite_remote_vfs_free`.
 pub type FreeFn = unsafe extern "C" fn(*mut c_char);
+/// Signature of `sqlite_remote_vfs_delete_database`.
+pub type DeleteFn = unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut c_char) -> c_int;
 
 /// Calls a register function and returns its result code and error message.
 pub fn call(
@@ -150,4 +152,40 @@ pub fn round_trip(name: &CStr, reregister: impl FnOnce() -> CString) {
         .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
         .expect("count rows");
     assert_eq!(rows, 100, "all rows must be read back from the server");
+}
+
+/// Calls a delete function and returns its result code and error message.
+pub fn call_delete(delete: DeleteFn, free: FreeFn, vfs: &CStr, db: &CStr) -> (c_int, Option<String>) {
+    let mut error: *mut c_char = std::ptr::null_mut();
+    // SAFETY: valid names and a writable error pointer.
+    let rc = unsafe { delete(vfs.as_ptr(), db.as_ptr(), &mut error) };
+    let message = (!error.is_null()).then(|| {
+        // SAFETY: a NUL-terminated message from the library.
+        let text = unsafe { CStr::from_ptr(error) }.to_string_lossy().into_owned();
+        // SAFETY: returned by the delete function and released once.
+        unsafe { free(error) };
+        text
+    });
+    (rc, message)
+}
+
+fn connect(vfs: &CStr) -> rusqlite::Connection {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    rusqlite::Connection::open_with_flags_and_vfs("db", flags, vfs.to_str().unwrap()).expect("open")
+}
+
+/// Creates table `t` with a few rows in database `db` of the VFS, then closes the database.
+pub fn write_rows(vfs: &CStr) {
+    let conn = connect(vfs);
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        .expect("create table");
+    conn.execute_batch("INSERT INTO t VALUES (1), (2), (3)")
+        .expect("insert");
+}
+
+/// Number of tables in database `db` of the VFS. Opening creates the database if it does not exist.
+pub fn tables(vfs: &CStr) -> i64 {
+    connect(vfs)
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .expect("count tables")
 }

@@ -574,6 +574,16 @@ impl Database {
         Ok(())
     }
 
+    /// Takes the local copy out of the database, so that the next database opened on this VFS can use it. In a browser
+    /// the local copy is a handle to the connection worker, which exists once per VFS.
+    #[cfg(target_arch = "wasm32")]
+    pub fn take_local(&mut self) -> Option<Box<dyn LocalStore>> {
+        match std::mem::replace(&mut self.local, LocalCopy::None) {
+            LocalCopy::Ready(store) => Some(store),
+            LocalCopy::None => None,
+        }
+    }
+
     /// Releases the lease. Best effort: if this fails, the lease expires on the server.
     pub fn close(&self, client: &mut Client) {
         if self.broken.is_some() || !client.is_connected() {

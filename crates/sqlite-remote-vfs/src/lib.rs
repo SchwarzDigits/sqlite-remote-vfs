@@ -170,7 +170,7 @@ pub struct Stats {
     pub resent_commits: u64,
 }
 
-/// Error returned when registering a VFS fails.
+/// Error returned when registering a VFS or deleting a database fails.
 #[derive(Debug)]
 pub struct Error(String);
 
@@ -289,6 +289,15 @@ impl RemoteVfs {
     /// Returns the current counters.
     pub fn stats(&self) -> Stats {
         *lock(&self.inner.stats)
+    }
+
+    /// Deletes the database `name` on the server, and its local copy. The database must not be open on this VFS.
+    ///
+    /// While another instance holds an unexpired lease on it, deleting fails unless [`Config::takeover`] is set; that
+    /// instance then can no longer commit. Deleting a database that does not exist succeeds. Opening `name` again
+    /// with `SQLITE_OPEN_CREATE` creates it empty, and it may then use another page size and another key.
+    pub fn delete_database(&self, name: &str) -> Result<(), Error> {
+        crate::vfs::delete_database(&self.inner, name).map_err(Error)
     }
 
     /// Marks the connection as broken, as after a network failure. The next request reconnects. For tests.

@@ -281,3 +281,61 @@ async fn stale_local_copy_is_caught_up() {
         stats.local_blocks_read
     );
 }
+
+#[wasm_bindgen_test]
+async fn local_copy_is_used_again_after_close_in_same_vfs() {
+    let Some(url) = SERVER else { return };
+    let subject = common::key();
+    let vfs = register(url, &subject, Local::Browser).await;
+    let conn = open(&vfs);
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+        .expect("create");
+    for id in 1..=30 {
+        conn.execute("INSERT INTO t VALUES (?1, ?2)", (id, format!("row {id}")))
+            .expect("insert");
+    }
+    drop(conn);
+
+    // Opened again through the same VFS: the local copy must still be in use.
+    let before = vfs.stats();
+    let conn = open(&vfs);
+    assert_eq!(count(&conn), 30);
+    let stats = vfs.stats();
+    assert_eq!(
+        stats.fetches, before.fetches,
+        "no fetch expected with a current local copy"
+    );
+    assert!(
+        stats.local_blocks_read > before.local_blocks_read,
+        "blocks must be read from the local copy"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn delete_removes_database_and_indexeddb_copy() {
+    let Some(url) = SERVER else { return };
+    let subject = common::key();
+    let copy_name = format!("sqlite-remote-vfs-copy-{}", sqlite_remote_vfs::subject(&*subject));
+    let vfs = register(url, &subject, Local::Browser).await;
+    let conn = open(&vfs);
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+        .expect("create");
+    conn.execute("INSERT INTO t VALUES (1, 'row')", []).expect("insert");
+    drop(conn);
+    let names = common::indexed_databases().await.expect("list IndexedDB databases");
+    assert!(
+        names.contains(&copy_name),
+        "local copy must exist before the deletion: {names:?}"
+    );
+
+    vfs.delete_database("db").expect("delete database");
+    let names = common::indexed_databases().await.expect("list IndexedDB databases");
+    assert!(!names.contains(&copy_name), "local copy must be deleted: {names:?}");
+
+    // Opened again: the database is empty.
+    let conn = open(&vfs);
+    let tables: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tables, 0, "recreated database must be empty");
+}

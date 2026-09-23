@@ -12,11 +12,10 @@ mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use js_sys::{Array, Function, Promise, Reflect};
 use rusqlite::{Connection, OpenFlags};
 use sqlite_remote_vfs::{Config, Load, RemoteVfs};
 use sqlite_wasm_rs as _;
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{StorageEstimate, WorkerGlobalScope, console};
@@ -61,29 +60,6 @@ async fn stored_bytes() -> Result<f64, String> {
     estimate
         .get_usage()
         .ok_or_else(|| "no usage in the estimate".to_string())
-}
-
-/// Names of the IndexedDB databases of this origin. Fails if the browser does not support
-/// `indexedDB.databases()`.
-async fn indexed_databases() -> Result<Vec<String>, String> {
-    let scope: JsValue = js_sys::global().into();
-    let idb = Reflect::get(&scope, &"indexedDB".into()).map_err(|_| "no indexedDB".to_string())?;
-    let function: Function = Reflect::get(&idb, &"databases".into())
-        .map_err(|_| "no databases()".to_string())?
-        .dyn_into()
-        .map_err(|_| "databases() is not a function".to_string())?;
-    let promise: Promise = function
-        .call0(&idb)
-        .map_err(|err| format!("databases(): {err:?}"))?
-        .dyn_into()
-        .map_err(|_| "databases() returned no promise".to_string())?;
-    let list = JsFuture::from(promise)
-        .await
-        .map_err(|err| format!("databases(): {err:?}"))?;
-    Ok(Array::from(&list)
-        .iter()
-        .filter_map(|entry| Reflect::get(&entry, &"name".into()).ok()?.as_string())
-        .collect())
 }
 
 #[wasm_bindgen_test]
@@ -136,7 +112,7 @@ async fn browser_storage_stays_empty() {
         }
         (before, after) => console::log_1(&format!("no storage estimate: {before:?} / {after:?}").into()),
     }
-    match indexed_databases().await {
+    match common::indexed_databases().await {
         Ok(names) => {
             console::log_1(&format!("IndexedDB holds {names:?}").into());
             assert!(names.is_empty(), "IndexedDB must be empty, found {names:?}");

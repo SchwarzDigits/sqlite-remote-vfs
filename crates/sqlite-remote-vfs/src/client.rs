@@ -225,6 +225,18 @@ impl Client {
         }
     }
 
+    /// Deletes a database on the server. Succeeds if it does not exist. It must not be open on this connection.
+    pub fn delete(&mut self, db_id: &str, takeover: bool) -> Result<(), ClientError> {
+        let answer = self.call(client_frame::Body::Delete(pb::Delete {
+            db_id: db_id.into(),
+            takeover,
+        }))?;
+        match answer {
+            server_frame::Body::Ok(_) => Ok(()),
+            other => Err(ClientError::Protocol(format!("expected Ok, got {other:?}"))),
+        }
+    }
+
     /// Returns the blocks changed since `from_version`, from the server's change log. Used to catch up an outdated
     /// local copy.
     pub fn changes(&mut self, db_id: &str, from_version: u64) -> Result<pb::Changes, ClientError> {

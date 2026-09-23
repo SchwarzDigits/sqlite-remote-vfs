@@ -7,7 +7,7 @@ mod common;
 use std::ffi::c_char;
 
 use common::{Login, call, registered, unique};
-use sqlite_remote_vfs_ffi::{sqlite_remote_vfs_free, sqlite_remote_vfs_register};
+use sqlite_remote_vfs_ffi::{sqlite_remote_vfs_delete_database, sqlite_remote_vfs_free, sqlite_remote_vfs_register};
 
 const SQLITE_ERROR: i32 = 1;
 const SQLITE_MISUSE: i32 = 21;
@@ -83,4 +83,35 @@ fn database_round_trips_with_plain_sqlite() {
         assert_eq!(rc, 0, "register again: {error:?}");
         again
     });
+}
+
+#[test]
+fn delete_through_unknown_vfs_is_misuse() {
+    let (rc, error) = common::call_delete(
+        sqlite_remote_vfs_delete_database,
+        sqlite_remote_vfs_free,
+        c"never-registered",
+        c"db",
+    );
+    assert_eq!(rc, SQLITE_MISUSE);
+    assert!(error.unwrap().contains("never-registered"));
+}
+
+#[test]
+fn database_deletes_through_c_interface() {
+    let Some(url) = common::server_url() else { return };
+    let login = Login::new(&url);
+    let name = unique("static-delete");
+    let (rc, error) = call(
+        sqlite_remote_vfs_register,
+        sqlite_remote_vfs_free,
+        &name,
+        &login.config(),
+    );
+    assert_eq!(rc, 0, "register: {error:?}");
+    common::write_rows(&name);
+
+    let (rc, error) = common::call_delete(sqlite_remote_vfs_delete_database, sqlite_remote_vfs_free, &name, c"db");
+    assert_eq!(rc, 0, "delete: {error:?}");
+    assert_eq!(common::tables(&name), 0, "the database must come back empty");
 }

@@ -217,6 +217,14 @@ impl VfsStore for Store {
         match file {
             RemoteFile::Main(main) => {
                 main.db.close(&mut lock(&main.inner.client));
+                // In a browser the local copy exists once per VFS. Hand it back for the next database.
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let mut main = main;
+                    if let Some(store) = main.db.take_local() {
+                        *lock(&data.browser_local) = Some(store);
+                    }
+                }
                 lock(&data.files).database = None;
             }
             RemoteFile::Temp(temp) => {
@@ -319,6 +327,40 @@ fn local_store(data: &AppData) -> Option<Box<dyn crate::local::LocalStore>> {
         #[cfg(target_arch = "wasm32")]
         Local::Browser => lock(&data.browser_local).take(),
     }
+}
+
+/// Deletes a database on the page server, then its local copy if the copy belongs to it. Fails if the database is
+/// open on this VFS.
+pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), String> {
+    // Held throughout, so that the database cannot be opened while it is being deleted.
+    let files = lock(&data.files);
+    if files.database.as_deref() == Some(name) {
+        return Err(format!("{name} is open; close it before deleting it"));
+    }
+    {
+        let mut client = lock(&data.client);
+        if !client.is_connected() {
+            client.reconnect().map_err(|err| err.to_string())?;
+        }
+        client
+            .delete(name, data.config.takeover)
+            .map_err(|err| format!("deleting {name}: {err}"))?;
+    }
+
+    let Some(mut store) = local_store(data) else {
+        return Ok(());
+    };
+    let subject = crate::subject(&*data.config.signer);
+    let result = match store.head() {
+        Ok(Some(head)) if head.subject == subject && head.db_id == name => store.clear(),
+        Ok(_) => Ok(()),
+        Err(err) => Err(err),
+    };
+    #[cfg(target_arch = "wasm32")]
+    {
+        *lock(&data.browser_local) = Some(store);
+    }
+    result.map_err(|err| format!("{name} was deleted on the server, but its local copy was not: {err}"))
 }
 
 /// Opens the database on the page server. Fails if this VFS already has a database open.

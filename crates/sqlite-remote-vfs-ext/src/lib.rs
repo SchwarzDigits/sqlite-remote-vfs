@@ -10,7 +10,9 @@
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-pub use sqlite_remote_vfs_ffi::{sqlite_remote_vfs_free, sqlite_remote_vfs_register};
+pub use sqlite_remote_vfs_ffi::{
+    sqlite_remote_vfs_delete_database, sqlite_remote_vfs_free, sqlite_remote_vfs_register,
+};
 
 const SQLITE_ERROR: c_int = 1;
 const SQLITE_MISUSE: c_int = 21;

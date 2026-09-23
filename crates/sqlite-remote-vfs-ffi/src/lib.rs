@@ -3,10 +3,11 @@
 //! Linked statically into a program that links SQLite itself, or wrapped by `sqlite-remote-vfs-ext` as a loadable
 //! SQLite extension. The layout of [`SqliteRemoteVfsConfig`] must match `sqlite_remote_vfs_config` in the header.
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlite_remote_vfs::{Algorithm, Config, Load, Local, Memory, RemoteVfs, Signer};
@@ -17,6 +18,10 @@ pub const ED25519: c_int = 1;
 const SQLITE_OK: c_int = 0;
 const SQLITE_ERROR: c_int = 1;
 const SQLITE_MISUSE: c_int = 21;
+
+/// The VFSes registered through this interface, by name. They stay registered for the life of the process, and
+/// `sqlite_remote_vfs_delete_database` finds them here.
+static REGISTERED: Mutex<BTreeMap<String, RemoteVfs>> = Mutex::new(BTreeMap::new());
 
 /// Buffer size for a signature. Ed25519 needs 64 bytes.
 const SIGNATURE_CAPACITY: usize = 1024;
@@ -213,8 +218,40 @@ unsafe fn register(name: *const c_char, config_ptr: *const SqliteRemoteVfsConfig
     let config = unsafe { config(&*config_ptr) }?;
     let vfs = RemoteVfs::register(&name, config).map_err(|err| Failure(SQLITE_ERROR, err.to_string()))?;
     // The VFS stays registered for the life of the process, so its handle, and with it the ping thread, is kept.
-    std::mem::forget(vfs);
+    REGISTERED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(name, vfs);
     Ok(())
+}
+
+/// Deletes a database through a registered VFS.
+///
+/// # Safety
+/// Arguments follow the contract in the header.
+unsafe fn delete_database(vfs_name: *const c_char, db_name: *const c_char) -> Result<(), Failure> {
+    // SAFETY: per the header.
+    let vfs_name = unsafe { string(vfs_name, "vfs_name") }?;
+    // SAFETY: per the header.
+    let db_name = unsafe { string(db_name, "db_name") }?;
+    let registered = REGISTERED.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let vfs = registered
+        .get(&vfs_name)
+        .ok_or_else(|| misuse(format!("no VFS named {vfs_name} was registered through this interface")))?;
+    vfs.delete_database(&db_name)
+        .map_err(|err| Failure(SQLITE_ERROR, err.to_string()))
+}
+
+/// Writes `message` to `*error` if `error` is not NULL.
+///
+/// # Safety
+/// `error` is NULL or points to a writable `char *`.
+unsafe fn report(error: *mut *mut c_char, message: String) {
+    if !error.is_null() {
+        let message = CString::new(message.replace('\0', " ")).unwrap_or_default();
+        // SAFETY: `error` is not NULL and writable per the caller's contract.
+        unsafe { *error = message.into_raw() };
+    }
 }
 
 /// `sqlite_remote_vfs_register` in the header.
@@ -234,11 +271,30 @@ pub unsafe extern "C" fn sqlite_remote_vfs_register(
         Ok(Err(failure)) => failure,
         Err(_) => Failure(SQLITE_ERROR, "internal error: the VFS panicked".into()),
     };
-    if !error.is_null() {
-        let message = CString::new(message.replace('\0', " ")).unwrap_or_default();
-        // SAFETY: `error` is not NULL and points to a `char *` per the header.
-        unsafe { *error = message.into_raw() };
-    }
+    // SAFETY: per the header.
+    unsafe { report(error, message) };
+    code
+}
+
+/// `sqlite_remote_vfs_delete_database` in the header.
+///
+/// # Safety
+/// Arguments follow the contract in the header.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn sqlite_remote_vfs_delete_database(
+    vfs_name: *const c_char,
+    db_name: *const c_char,
+    error: *mut *mut c_char,
+) -> c_int {
+    // SAFETY: per the header.
+    let result = catch_unwind(AssertUnwindSafe(|| unsafe { delete_database(vfs_name, db_name) }));
+    let Failure(code, message) = match result {
+        Ok(Ok(())) => return SQLITE_OK,
+        Ok(Err(failure)) => failure,
+        Err(_) => Failure(SQLITE_ERROR, "internal error: the VFS panicked".into()),
+    };
+    // SAFETY: per the header.
+    unsafe { report(error, message) };
     code
 }
 

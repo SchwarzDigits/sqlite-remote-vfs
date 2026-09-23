@@ -26,6 +26,9 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   challenge. Use a separate key for each server.
 - **One writer per database.** Opening a database acquires a lease. A newer lease has a higher epoch and fences off
   all older ones, so an outdated client cannot overwrite newer data.
+- **Deletion.** `RemoteVfs::delete_database` deletes a database on the server, and its local copy. Opened again with
+  `SQLITE_OPEN_CREATE`, it comes back empty and may use another page size and another key. A client that held a lease
+  on the deleted database can no longer commit, also not after the database was created anew.
 - **Local copy (optional).** A file natively, IndexedDB in the browser. Reads are served from it without a round
   trip. It contains only data the server has acknowledged and may be incomplete; missing blocks are fetched from the
   server. A stale copy is brought up to date from the server's change log: only the blocks changed since its version
@@ -108,6 +111,7 @@ The interface is declared in `crates/sqlite-remote-vfs-ffi/include/sqlite_remote
    extension, call it from the loaded library: link against it or look it up with `dlsym`. The private key stays in
    the calling program; the sign function is called at every login.
 3. Open databases through the VFS name, or through `multipleciphers-<name>` with SQLite3 Multiple Ciphers.
+4. To delete a database, call `sqlite_remote_vfs_delete_database()` with the VFS name and the database name.
 
 A program that links the static library also links SQLite and the system libraries that
 `cargo rustc -p sqlite-remote-vfs-ffi --crate-type staticlib -- --print native-static-libs` lists.

@@ -9,7 +9,7 @@ mod common;
 use std::ffi::{c_char, c_void};
 use std::path::PathBuf;
 
-use common::{FreeFn, Login, RegisterFn, call, registered, unique};
+use common::{DeleteFn, FreeFn, Login, RegisterFn, call, registered, unique};
 use libloading::Library;
 use rusqlite::Connection;
 
@@ -119,4 +119,22 @@ fn extension_registers_with_the_loading_sqlite() {
         assert_eq!(rc, 0, "register again: {error:?}");
         again
     });
+}
+
+#[test]
+fn database_deletes_through_extension() {
+    let Some(url) = common::server_url() else { return };
+    let path = load();
+    let (library, register, free) = open(&path);
+    // SAFETY: the symbol has this signature, as declared in the header.
+    let delete = unsafe { *library.get::<DeleteFn>(b"sqlite_remote_vfs_delete_database").unwrap() };
+    let login = Login::new(&url);
+    let name = unique("ext-delete");
+    let (rc, error) = call(register, free, &name, &login.config());
+    assert_eq!(rc, 0, "register: {error:?}");
+    common::write_rows(&name);
+
+    let (rc, error) = common::call_delete(delete, free, &name, c"db");
+    assert_eq!(rc, 0, "delete: {error:?}");
+    assert_eq!(common::tables(&name), 0, "the database must come back empty");
 }

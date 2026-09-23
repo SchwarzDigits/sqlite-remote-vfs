@@ -76,7 +76,19 @@ typedef struct sqlite_remote_vfs_config {
  */
 int sqlite_remote_vfs_register(const char *name, const sqlite_remote_vfs_config *config, char **error);
 
-/* Releases a message returned by sqlite_remote_vfs_register(). NULL is allowed. */
+/*
+ * Deletes the database `db_name` on the server, and its local copy, through the VFS `vfs_name` registered with
+ * sqlite_remote_vfs_register(). The database must not be open. While another instance holds an unexpired lease on it,
+ * deleting fails unless the VFS was registered with `takeover`. Deleting a database that does not exist succeeds.
+ * Opening it again with SQLITE_OPEN_CREATE creates it empty, with any page size and any key.
+ *
+ * Returns 0 on success. On failure returns a nonzero SQLite result code and, if `error` is not NULL, sets `*error` to
+ * a message that the caller releases with sqlite_remote_vfs_free().
+ */
+int sqlite_remote_vfs_delete_database(const char *vfs_name, const char *db_name, char **error);
+
+/* Releases a message returned by sqlite_remote_vfs_register() or sqlite_remote_vfs_delete_database(). NULL is
+ * allowed. */
 void sqlite_remote_vfs_free(char *message);
 
 #ifdef __cplusplus

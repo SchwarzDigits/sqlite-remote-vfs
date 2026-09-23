@@ -755,3 +755,112 @@ fn other_key_cannot_open_database() {
     let opened = Connection::open_with_flags_and_vfs("db", flags, other.encrypted_name().as_str());
     assert!(opened.is_err(), "open must fail for another key");
 }
+
+fn tables(conn: &Connection) -> i64 {
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap()
+}
+
+#[test]
+fn deleted_database_comes_back_empty_with_new_key() {
+    let Some(url) = server_url() else { return };
+    let vfs = register(Config::new(&url, TestSigner::fresh()));
+    fill(&vfs, 30);
+    vfs.delete_database("db").expect("delete database");
+
+    // Nothing of the old database remains, so a new key works.
+    let conn = open(&vfs, "db", &OTHER_KEY).expect("open recreated database");
+    assert_eq!(tables(&conn), 0, "recreated database must be empty");
+    conn.execute_batch(CREATE).unwrap();
+    insert_rows(&conn, 0, 5, 100);
+    assert_eq!(count(&conn), 5);
+}
+
+#[test]
+fn deleted_database_is_not_found_without_create() {
+    let Some(url) = server_url() else { return };
+    let vfs = register(Config::new(&url, TestSigner::fresh()));
+    fill(&vfs, 10);
+    vfs.delete_database("db").expect("delete database");
+
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let result = Connection::open_with_flags_and_vfs("db", flags, vfs.encrypted_name().as_str())
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0)));
+    assert!(result.is_err(), "opening a deleted database without create must fail");
+}
+
+#[test]
+fn delete_fences_holder_also_after_recreate() {
+    let Some(url) = server_url() else { return };
+    let subject = TestSigner::fresh();
+    let holder = register(Config::new(&url, subject.clone()));
+    let holder_conn = open(&holder, "db", &KEY).unwrap();
+    holder_conn.execute_batch(CREATE).unwrap();
+    insert_rows(&holder_conn, 0, 10, 100);
+
+    let mut config = Config::new(&url, subject);
+    config.takeover = true;
+    let deleter = register(config);
+    deleter.delete_database("db").expect("delete with takeover");
+    let recreated = open(&deleter, "db", &OTHER_KEY).unwrap();
+    recreated.execute_batch(CREATE).unwrap();
+    insert_rows(&recreated, 0, 3, 100);
+
+    // The holder of the deleted database must not commit, also not into the database created under the same name.
+    let err = holder_conn
+        .execute("INSERT INTO t (id, payload) VALUES (1000, x'00')", [])
+        .unwrap_err();
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::SystemIoFailure), "{err}");
+    assert_eq!(count(&recreated), 3);
+}
+
+#[test]
+fn delete_without_takeover_fails_while_lease_is_held() {
+    let Some(url) = server_url() else { return };
+    let subject = TestSigner::fresh();
+    let holder = register(Config::new(&url, subject.clone()));
+    let _holder_conn = open(&holder, "db", &KEY).unwrap();
+
+    let other = register(Config::new(&url, subject));
+    let err = other
+        .delete_database("db")
+        .expect_err("an active lease must block the deletion");
+    assert!(err.to_string().contains("LEASE_HELD"), "{err}");
+}
+
+#[test]
+fn deleting_an_open_database_is_refused() {
+    let Some(url) = server_url() else { return };
+    let vfs = register(Config::new(&url, TestSigner::fresh()));
+    let _conn = open(&vfs, "db", &KEY).unwrap();
+    let err = vfs
+        .delete_database("db")
+        .expect_err("an open database must not be deleted");
+    assert!(err.to_string().contains("close it"), "{err}");
+}
+
+#[test]
+fn delete_removes_local_copy_of_that_database_only() {
+    let Some(url) = server_url() else { return };
+    let subject = TestSigner::fresh();
+    let path = copy_path("delete");
+
+    let vfs = register(with_copy(&url, &subject, &path));
+    fill(&vfs, 20);
+    drop(vfs);
+    assert!(path.exists(), "local copy must have been written");
+
+    let vfs = register(with_copy(&url, &subject, &path));
+    vfs.delete_database("other").expect("delete another database");
+    assert!(path.exists(), "the local copy of another database must stay");
+    vfs.delete_database("db").expect("delete database");
+    assert!(!path.exists(), "the local copy of the deleted database must be removed");
+}
+
+#[test]
+fn deleting_a_missing_database_succeeds() {
+    let Some(url) = server_url() else { return };
+    let vfs = register(Config::new(&url, TestSigner::fresh()));
+    vfs.delete_database("never-created").expect("first delete");
+    vfs.delete_database("never-created").expect("second delete");
+}

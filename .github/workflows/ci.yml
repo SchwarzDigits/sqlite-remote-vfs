@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   # Commit of github.com/SchwarzDigits/sqlite-remote-server that the tests run against. Raised deliberately, after
   # the server's own CI passed.
-  SERVER_VERSION: ca989a5dc6c671edd3a89bac4eb809a714f1946e
+  SERVER_VERSION: ab980cd33481fd92c854f76564c6bf760a0d9175
 
 # Every job starts that server with the start-server action, which sets SQLITE_REMOTE_TEST_URL. The tests that need a
 # server skip themselves without it.
