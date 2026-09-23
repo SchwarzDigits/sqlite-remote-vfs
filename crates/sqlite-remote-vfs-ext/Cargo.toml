@@ -6,8 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 description = "sqlite-remote-vfs as a loadable SQLite extension"
 
-# Builds libsqlite_remote_vfs_ext.so / .dylib. SQLite derives the entry point sqlite3_sqliteremotevfsext_init from
-# the file name.
+# Builds libsqlite_remote_vfs_ext.so / .dylib, or sqlite_remote_vfs_ext.dll on Windows. SQLite derives the entry
+# point sqlite3_sqliteremotevfsext_init from the file name.
 [lib]
 crate-type = ["cdylib"]
 

@@ -22,6 +22,8 @@ fn library_path() -> PathBuf {
         .unwrap_or_else(|| {
             let file = if cfg!(target_os = "macos") {
                 "libsqlite_remote_vfs_ext.dylib"
+            } else if cfg!(windows) {
+                "sqlite_remote_vfs_ext.dll"
             } else {
                 "libsqlite_remote_vfs_ext.so"
             };

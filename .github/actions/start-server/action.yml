@@ -23,6 +23,7 @@ runs:
         go-version: stable
         cache: false
     - name: Install and start sqlite-remote-server
+      if: runner.os != 'Windows'
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
@@ -45,4 +46,37 @@ runs:
         done
         echo "sqlite-remote-server did not become ready:" >&2
         cat "$RUNNER_TEMP/sqlite-remote-server.log" >&2
+        exit 1
+    # The same in PowerShell, for Windows runners.
+    - name: Install and start sqlite-remote-server (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        VERSION: ${{ inputs.version }}
+        STORE: ${{ inputs.store }}
+        DATABASE_URL: ${{ inputs.database-url }}
+        PORT: ${{ inputs.port }}
+      run: |
+        go install "github.com/SchwarzDigits/sqlite-remote-server/cmd/sqlite-remote-server@$env:VERSION"
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        $url = "ws://127.0.0.1:$env:PORT/v1/ws"
+        $env:SQLITE_REMOTE_PORT = $env:PORT
+        $env:SQLITE_REMOTE_SERVER_ID = $url
+        $env:SQLITE_REMOTE_STORE = $env:STORE
+        $env:SQLITE_REMOTE_DATABASE_URL = $env:DATABASE_URL
+        $env:SQLITE_REMOTE_ALLOWED_ORIGINS = '127.0.0.1:*,localhost:*'
+        $log = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.log'
+        $errors = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.err.log'
+        Start-Process -FilePath (Join-Path (go env GOPATH) 'bin\sqlite-remote-server.exe') -NoNewWindow `
+          -RedirectStandardOutput $log -RedirectStandardError $errors
+        for ($i = 0; $i -lt 100; $i++) {
+          curl.exe -sf "http://127.0.0.1:$env:PORT/.well-known/ready" > $null
+          if ($LASTEXITCODE -eq 0) {
+            "SQLITE_REMOTE_TEST_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            exit 0
+          }
+          Start-Sleep -Milliseconds 200
+        }
+        Write-Host "sqlite-remote-server did not become ready:"
+        Get-Content $log, $errors
         exit 1
