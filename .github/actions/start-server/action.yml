@@ -67,7 +67,8 @@ runs:
         $env:SQLITE_REMOTE_ALLOWED_ORIGINS = '127.0.0.1:*,localhost:*'
         $log = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.log'
         $errors = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.err.log'
-        Start-Process -FilePath (Join-Path (go env GOPATH) 'bin\sqlite-remote-server.exe') -NoNewWindow `
+        # In a console of its own. With -NoNewWindow, sharing the step's console, the server was gone in the next step.
+        Start-Process -FilePath (Join-Path (go env GOPATH) 'bin\sqlite-remote-server.exe') -WindowStyle Hidden `
           -RedirectStandardOutput $log -RedirectStandardError $errors
         for ($i = 0; $i -lt 100; $i++) {
           curl.exe -sf "http://127.0.0.1:$env:PORT/.well-known/ready" > $null
