@@ -77,7 +77,8 @@ pub enum Local {
     /// Local copy in this file.
     #[cfg(not(target_arch = "wasm32"))]
     File(std::path::PathBuf),
-    /// Local copy in IndexedDB, managed by the connection worker.
+    /// Local copy in IndexedDB, managed by the connection worker: one IndexedDB database per database, named
+    /// `sqlite-remote-vfs-copy-<subject>/<database>`.
     #[cfg(target_arch = "wasm32")]
     Browser,
 }

@@ -29,9 +29,9 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
 - **Deletion.** `RemoteVfs::delete_database` deletes a database on the server, and its local copy. Opened again with
   `SQLITE_OPEN_CREATE`, it comes back empty and may use another page size and another key. A client that held a lease
   on the deleted database can no longer commit, also not after the database was created anew.
-- **Local copy (optional).** A file natively, IndexedDB in the browser. Reads are served from it without a round
-  trip. It contains only data the server has acknowledged and may be incomplete; missing blocks are fetched from the
-  server. A stale copy is brought up to date from the server's change log: only the blocks changed since its version
+- **Local copy (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
+  databases of one key keep their own copies. Reads are served from it without a round trip. It contains only data
+  the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale copy is brought up to date from the server's change log: only the blocks changed since its version
   are discarded.
 - **Memory limit (optional).** `Memory::Blocks(n)` keeps at most `n` blocks in memory and evicts the least recently
   used. Blocks modified since the last commit are never evicted.

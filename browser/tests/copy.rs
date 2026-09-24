@@ -39,8 +39,12 @@ async fn register(url: &str, subject: &Arc<dyn Signer>, local: Local) -> RemoteV
 }
 
 fn open(vfs: &RemoteVfs) -> Connection {
+    open_named(vfs, "db")
+}
+
+fn open_named(vfs: &RemoteVfs, name: &str) -> Connection {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags_and_vfs("db", flags, vfs.encrypted_name().as_str()).expect("open");
+    let conn = Connection::open_with_flags_and_vfs(name, flags, vfs.encrypted_name().as_str()).expect("open");
     let hex: String = KEY.iter().map(|b| format!("{b:02x}")).collect();
     conn.pragma_update(None, "key", format!("x'{hex}'")).expect("key");
     let _: String = conn
@@ -315,7 +319,7 @@ async fn local_copy_is_used_again_after_close_in_same_vfs() {
 async fn delete_removes_database_and_indexeddb_copy() {
     let Some(url) = SERVER else { return };
     let subject = common::key();
-    let copy_name = format!("sqlite-remote-vfs-copy-{}", sqlite_remote_vfs::subject(&*subject));
+    let copy_name = format!("sqlite-remote-vfs-copy-{}/db", sqlite_remote_vfs::subject(&*subject));
     let vfs = register(url, &subject, Local::Browser).await;
     let conn = open(&vfs);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
@@ -341,4 +345,46 @@ async fn delete_removes_database_and_indexeddb_copy() {
         .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
         .unwrap();
     assert_eq!(tables, 0, "recreated database must be empty");
+}
+
+/// Two databases under one key, open at the same time through two VFSes, as an application with two databases has
+/// them. Each keeps its own local copy.
+#[wasm_bindgen_test]
+async fn two_databases_of_one_key_keep_their_own_copies() {
+    let Some(url) = SERVER else { return };
+    let subject = common::key();
+    let databases = [("first", 10), ("second", 20)];
+
+    let first = register(url, &subject, Local::Browser).await;
+    let second = register(url, &subject, Local::Browser).await;
+    for ((name, rows), vfs) in databases.iter().zip([&first, &second]) {
+        let conn = open_named(vfs, name);
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+            .expect("create");
+        for id in 1..=*rows {
+            conn.execute("INSERT INTO t VALUES (?1, ?2)", (id, format!("row {id}")))
+                .expect("insert");
+        }
+    }
+    // The connection workers write the local copies asynchronously. Opening each database once more reads its copy,
+    // which waits for the pending writes.
+    for ((name, _), vfs) in databases.iter().zip([&first, &second]) {
+        drop(open_named(vfs, name));
+    }
+    drop((first, second));
+
+    for (name, rows) in databases {
+        let vfs = register(url, &subject, Local::Browser).await;
+        let conn = open_named(&vfs, name);
+        assert_eq!(count(&conn), rows, "{name}: all rows must be read back");
+        let stats = vfs.stats();
+        assert_eq!(
+            stats.fetches, 0,
+            "{name}: no fetch expected, its local copy must be complete"
+        );
+        assert!(
+            stats.local_blocks_read > 0,
+            "{name}: blocks must be read from the local copy"
+        );
+    }
 }

@@ -47,6 +47,12 @@ pub(crate) trait LocalStore: AcrossThreads {
 
     /// Deletes the local copy.
     fn clear(&mut self) -> Result<(), String>;
+
+    /// Switches to the copy of database `db_id`, for a store that keeps one copy per database. A store with a single
+    /// copy ignores it.
+    fn select(&mut self, _db_id: &str) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

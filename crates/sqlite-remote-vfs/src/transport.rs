@@ -259,6 +259,7 @@ mod imp {
     const OP_COPY_WRITE: i32 = 7;
     const OP_COPY_CLEAR: i32 = 8;
     const OP_COPY_FORGET: i32 = 9;
+    const OP_COPY_SELECT: i32 = 10;
 
     /// Size of the region for each direction. It must hold the largest frame the server allows.
     const CAPACITY: u32 = 2 << 20;
@@ -416,6 +417,19 @@ mod imp {
                 _ => Err(self.0.answer_text()),
             }
         }
+
+        fn select(&mut self, db_id: &str) -> Result<(), String> {
+            let name = db_id.as_bytes();
+            let length = u32::try_from(name.len())
+                .ok()
+                .filter(|length| *length <= CAPACITY)
+                .ok_or_else(|| "database name exceeds the bridge buffer".to_string())?;
+            self.0.request.subarray(0, length).copy_from(name);
+            match self.0.ask(OP_COPY_SELECT, length)? {
+                (KIND_DONE, _) => Ok(()),
+                _ => Err(self.0.answer_text()),
+            }
+        }
     }
 
     /// Encodes the head in the layout the worker reads, little-endian: page size, page count, version, the lengths of
@@ -539,7 +553,7 @@ mod imp {
             ("op", "start".into()),
             ("url", config.url.as_str().into()),
             (
-                "copyName",
+                "copyPrefix",
                 format!("sqlite-remote-vfs-copy-{}", crate::subject(&*config.signer))
                     .as_str()
                     .into(),

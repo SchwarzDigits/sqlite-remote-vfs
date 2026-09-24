@@ -41,6 +41,7 @@ const OP_COPY_READ = 6;
 const OP_COPY_WRITE = 7;
 const OP_COPY_CLEAR = 8;
 const OP_COPY_FORGET = 9;
+const OP_COPY_SELECT = 10;
 
 const encoder = new TextEncoder();
 
@@ -51,14 +52,16 @@ let url = null;
 let socket = null;
 let closed = false;
 
-// Local copy: one IndexedDB database with a "blocks" store keyed by block index and a "head" store. Both are written
-// in one transaction, so the head always matches the blocks.
+// Local copy: one IndexedDB database per database name, named copyPrefix + "/" + name, with a "blocks" store keyed
+// by block index and a "head" store. Both are written in one transaction, so the head always matches the blocks.
+// OP_COPY_SELECT chooses the database the other operations work on.
+let copyPrefix = null;
 let copyName = null;
 let copy = null;
 let pending = [];
 let chain = Promise.resolve();
-// Set if clearing the local copy after a failed write also failed. The copy is then never read again.
-let givenUp = false;
+// Copies for which clearing after a failed write also failed. They are never read again.
+const givenUp = new Set();
 
 // Frames received before the SQLite worker asked for them, and the first connection error, which is returned for
 // every later request.
@@ -244,8 +247,9 @@ function work() {
             // Clear the local copy. The server has every block, so nothing is lost, and the next open loads from the
             // server. If clearing fails too, never read the copy again: it could return blocks older than its head
             // claims.
+            const name = copyName;
             await copyClear().catch(() => {
-              givenUp = true;
+              givenUp.add(name);
             });
           }
         });
@@ -281,6 +285,19 @@ function work() {
         put(KIND_DONE, null);
       });
       break;
+
+    case OP_COPY_SELECT: {
+      const name = new TextDecoder().decode(request.slice(0, Atomics.load(control, REQUEST_LENGTH)));
+      queue(async () => {
+        if (copy !== null) {
+          (await copy).close();
+          copy = null;
+        }
+        copyName = copyPrefix + "/" + name;
+        put(KIND_DONE, null);
+      });
+      break;
+    }
   }
 }
 
@@ -302,6 +319,9 @@ function queue(job) {
 function openCopy() {
   if (copy !== null) {
     return copy;
+  }
+  if (copyName === null) {
+    return Promise.reject(new Error("no database selected"));
   }
   copy = new Promise((resolve, reject) => {
     const request = indexedDB.open(copyName, 1);
@@ -367,7 +387,7 @@ function headFrom(bytes) {
 }
 
 async function copyHead() {
-  if (givenUp) {
+  if (givenUp.has(copyName)) {
     return null;
   }
   const database = await openCopy();
@@ -407,7 +427,7 @@ async function copyRead(first, count) {
 
 // Writes blocks and head in one transaction, so a crash leaves either the old or the new state.
 async function copyWrite(head, blocks) {
-  if (givenUp) {
+  if (givenUp.has(copyName)) {
     return;
   }
   const database = await openCopy();
@@ -425,7 +445,7 @@ async function copyWrite(head, blocks) {
 // Catches up the local copy: deletes the given blocks and sets the new head, in one transaction. All other blocks
 // are unchanged in the new version.
 async function copyForget(head, blocks) {
-  if (givenUp) {
+  if (givenUp.has(copyName)) {
     return;
   }
   const database = await openCopy();
@@ -441,6 +461,9 @@ async function copyForget(head, blocks) {
 }
 
 async function copyClear() {
+  if (copyName === null) {
+    return;
+  }
   if (copy !== null) {
     (await copy).close();
     copy = null;
@@ -495,7 +518,7 @@ self.onmessage = (event) => {
   request = new Uint8Array(message.buffer, dataStart, message.capacity);
   answer = new Uint8Array(message.buffer, dataStart + message.capacity, message.capacity);
   url = message.url;
-  copyName = message.copyName;
+  copyPrefix = message.copyPrefix;
   connect();
   if (typeof Atomics.waitAsync === "function") {
     serve();

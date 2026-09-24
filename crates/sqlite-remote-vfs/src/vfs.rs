@@ -217,7 +217,7 @@ impl VfsStore for Store {
         match file {
             RemoteFile::Main(main) => {
                 main.db.close(&mut lock(&main.inner.client));
-                // In a browser the local copy exists once per VFS. Hand it back for the next database.
+                // In a browser the local copy store exists once per VFS. Hand it back for the next database.
                 #[cfg(target_arch = "wasm32")]
                 {
                     let mut main = main;
@@ -317,15 +317,27 @@ impl SQLiteVfs<Io> for Vfs {
     }
 }
 
-/// Creates the local copy store configured in `Config::local`.
-fn local_store(data: &AppData) -> Option<Box<dyn crate::local::LocalStore>> {
-    match &data.config.local {
-        Local::None => None,
+/// Creates the local copy store configured in `Config::local` and selects database `name` in it.
+fn local_store(data: &AppData, name: &str) -> Option<Box<dyn crate::local::LocalStore>> {
+    let mut store: Box<dyn crate::local::LocalStore> = match &data.config.local {
+        Local::None => return None,
         #[cfg(not(target_arch = "wasm32"))]
-        Local::File(path) => Some(Box::new(crate::local::FileStore::new(path))),
-        // Held by the connection worker. It was passed in when the VFS was registered.
+        Local::File(path) => Box::new(crate::local::FileStore::new(path)),
+        // Held by the connection worker. It was passed in when the VFS was registered and keeps one IndexedDB database
+        // per database name.
         #[cfg(target_arch = "wasm32")]
-        Local::Browser => lock(&data.browser_local).take(),
+        Local::Browser => lock(&data.browser_local).take()?,
+    };
+    match store.select(name) {
+        Ok(()) => Some(store),
+        // Without a local copy the database is read from the server.
+        Err(_) => {
+            #[cfg(target_arch = "wasm32")]
+            {
+                *lock(&data.browser_local) = Some(store);
+            }
+            None
+        }
     }
 }
 
@@ -347,7 +359,7 @@ pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), String> 
             .map_err(|err| format!("deleting {name}: {err}"))?;
     }
 
-    let Some(mut store) = local_store(data) else {
+    let Some(mut store) = local_store(data, name) else {
         return Ok(());
     };
     let subject = crate::subject(&*data.config.signer);
@@ -394,7 +406,7 @@ fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Database
             Memory::Blocks(blocks) => Some(blocks),
         },
         subject: crate::subject(&*data.config.signer),
-        local: local_store(data),
+        local: local_store(data, name),
     };
     match Database::open(&mut client, name, options, &mut lock(&data.stats)) {
         Ok(db) => {
