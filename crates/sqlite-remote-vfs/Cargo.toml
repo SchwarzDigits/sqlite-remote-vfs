@@ -19,8 +19,10 @@ sha2 = { version = "0.10", default-features = false }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-# Blocking WebSocket client for native targets. In a browser the connection worker holds the WebSocket.
-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# Blocking WebSocket client for native targets. In a browser the connection worker holds the WebSocket. 0.30 differs
+# from 0.29 only on the server side and in newer rand and sha1 versions. With 0.29, a project that already depends on
+# the older ones adds fewer packages.
+tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.3", features = ["wasm_js"] }
