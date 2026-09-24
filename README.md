@@ -31,8 +31,8 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   on the deleted database can no longer commit, also not after the database was created anew.
 - **Local copy (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
   databases of one key keep their own copies. Reads are served from it without a round trip. It contains only data
-  the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale copy is brought up to date from the server's change log: only the blocks changed since its version
-  are discarded.
+  the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale copy is
+  brought up to date from the server's change log: only the blocks changed since its version are discarded.
 - **Memory limit (optional).** `Memory::Blocks(n)` keeps at most `n` blocks in memory and evicts the least recently
   used. Blocks modified since the last commit are never evicted.
 - **Loading.** `Load::Preload` (default) reads the whole database when it is opened. `Load::OnDemand` fetches blocks
