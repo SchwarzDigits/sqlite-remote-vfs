@@ -478,6 +478,10 @@ fn delete_on_server(data: &AppData, name: &str) -> Result<(), String> {
 }
 
 /// Opens the database on the page server or locally. Fails if this VFS already has a database open.
+///
+/// SQLite gets `SQLITE_CANTOPEN` only if the database does not exist and `create` is false, and `SQLITE_BUSY` if
+/// another instance has it open. Every other failure, e.g. of the connection, is `SQLITE_IOERR`, so that an
+/// application can tell a missing database from one it cannot reach.
 fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Db> {
     let mut files = lock(&data.files);
     if let Some(open) = &files.database {
@@ -516,7 +520,7 @@ fn open_on_server(data: &AppData, server: &ServerBackend, name: &str, create: bo
     if !client.is_connected() {
         client
             .reconnect()
-            .map_err(|err| io_error(VfsErrorCode::CantOpen, err.to_string()))?;
+            .map_err(|err| io_error(VfsErrorCode::Io, err.to_string()))?;
     }
     let options = OpenOptions {
         page_size: data.config.page_size,
@@ -530,7 +534,8 @@ fn open_on_server(data: &AppData, server: &ServerBackend, name: &str, create: bo
     match Database::open(&mut client, name, options, &mut lock(&data.stats)) {
         Ok(db) => Ok(db),
         Err(err) if err.is_lease_held() => Err(io_error(VfsErrorCode::Busy, err.to_string())),
-        Err(err) => Err(io_error(VfsErrorCode::CantOpen, err.to_string())),
+        Err(err) if err.is_not_found() => Err(io_error(VfsErrorCode::CantOpen, err.to_string())),
+        Err(err) => Err(io_error(VfsErrorCode::Io, err.to_string())),
     }
 }
 
@@ -553,7 +558,8 @@ fn open_locally(
     LocalDatabase::open(bridge.clone(), name, options, &mut lock(&data.stats)).map_err(|refusal| {
         let code = match refusal {
             Refusal::Busy => VfsErrorCode::Busy,
-            _ => VfsErrorCode::CantOpen,
+            Refusal::Missing => VfsErrorCode::CantOpen,
+            _ => VfsErrorCode::Io,
         };
         io_error(code, format!("{name}: {refusal}"))
     })

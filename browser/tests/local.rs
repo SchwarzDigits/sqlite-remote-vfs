@@ -72,10 +72,7 @@ fn integrity(conn: &Connection) -> String {
 }
 
 fn is_busy(err: &rusqlite::Error) -> bool {
-    matches!(
-        err.sqlite_error_code(),
-        Some(ErrorCode::DatabaseBusy | ErrorCode::CannotOpen)
-    )
+    err.sqlite_error_code() == Some(ErrorCode::DatabaseBusy)
 }
 
 #[wasm_bindgen_test]

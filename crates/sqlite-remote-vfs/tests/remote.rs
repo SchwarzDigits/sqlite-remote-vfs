@@ -153,13 +153,7 @@ fn held_lease_blocks_second_open() {
     let other = register(Config::server(&url, subject.clone()));
     let err = open(&other, "db", &KEY).unwrap_err();
     println!("open while the lease is held: {err}");
-    assert!(
-        matches!(
-            err.sqlite_error_code(),
-            Some(ErrorCode::DatabaseBusy | ErrorCode::CannotOpen)
-        ),
-        "{err}"
-    );
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::DatabaseBusy), "{err}");
 }
 
 #[test]
@@ -783,10 +777,121 @@ fn deleted_database_is_not_found_without_create() {
     fill(&vfs, 10);
     vfs.delete_database("db").expect("delete database");
 
+    let err = open_existing(&vfs, "db").expect_err("opening a deleted database without create must fail");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::CannotOpen), "{err}");
+}
+
+/// Opens an existing database, without `SQLITE_OPEN_CREATE`, and reads its schema.
+fn open_existing(vfs: &RemoteVfs, db: &str) -> rusqlite::Result<i64> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let result = Connection::open_with_flags_and_vfs("db", flags, vfs.encrypted_name().as_str())
-        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0)));
-    assert!(result.is_err(), "opening a deleted database without create must fail");
+    let conn = Connection::open_with_flags_and_vfs(db, flags, vfs.encrypted_name().as_str())?;
+    conn.pragma_update(None, "key", raw_key(&KEY))?;
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+}
+
+#[test]
+fn deletion_by_the_server_does_not_bring_back_the_local_copy() {
+    // The server deletes unused databases on its own. The local copy of the owner stays and must not come back.
+    let Some(url) = server_url() else { return };
+    let subject = TestSigner::fresh();
+    let path = copy_path("deleted-elsewhere");
+    let vfs = register(with_copy(&url, &subject, &path));
+    fill(&vfs, 50);
+    drop(vfs);
+
+    // Deleted by an instance without the local copy, as by the server.
+    let deleter = register(Config::server(&url, subject.clone()));
+    deleter.delete_database("db").expect("delete");
+    drop(deleter);
+
+    let vfs = register(with_copy(&url, &subject, &path));
+    let err = open_existing(&vfs, "db").expect_err("the database was deleted");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::CannotOpen), "{err}");
+
+    let conn = open(&vfs, "db", &KEY).expect("create anew");
+    let tables: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tables, 0, "the database created anew is empty");
+    assert_eq!(
+        vfs.stats().local_blocks_read,
+        0,
+        "nothing is read from the old local copy"
+    );
+}
+
+#[test]
+fn unreachable_server_is_an_io_error_not_a_missing_database() {
+    let Some(url) = server_url() else { return };
+    let proxy = Relay::start(&url);
+    let vfs = register(Config::server(proxy.url(), TestSigner::fresh()));
+    fill(&vfs, 5);
+
+    proxy.stop();
+    vfs.drop_connection();
+    let err = open_existing(&vfs, "db").expect_err("the server is unreachable");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::SystemIoFailure), "{err}");
+}
+
+/// TCP relay to the server that can be stopped, to make the server unreachable.
+struct Relay {
+    url: String,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+    streams: Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>,
+}
+
+impl Relay {
+    fn start(server_url: &str) -> Relay {
+        use std::net::{TcpListener, TcpStream};
+
+        let authority = server_url
+            .trim_start_matches("ws://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_string();
+        let path = &server_url["ws://".len() + authority.len()..];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}{path}", listener.local_addr().unwrap());
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (stop, open) = (stopped.clone(), streams.clone());
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(client) = client else { continue };
+                if stop.load(Ordering::Relaxed) {
+                    // Refuse: the server is gone.
+                    continue;
+                }
+                let upstream = TcpStream::connect(&authority).unwrap();
+                open.lock()
+                    .unwrap()
+                    .extend([client.try_clone().unwrap(), upstream.try_clone().unwrap()]);
+                for (mut from, mut to) in [
+                    (client.try_clone().unwrap(), upstream.try_clone().unwrap()),
+                    (upstream, client),
+                ] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Relay { url, stopped, streams }
+    }
+
+    fn url(&self) -> String {
+        self.url.clone()
+    }
+
+    /// Closes every relayed connection and closes new ones right away.
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        for stream in self.streams.lock().unwrap().drain(..) {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 #[test]

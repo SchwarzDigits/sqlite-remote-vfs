@@ -357,6 +357,45 @@ async fn local_copy_is_used_again_after_close_in_same_vfs() {
 }
 
 #[wasm_bindgen_test]
+async fn deletion_by_the_server_does_not_bring_back_the_local_copy() {
+    // The server deletes unused databases on its own. The local copy in IndexedDB stays and must not come back.
+    let Some(url) = SERVER else { return };
+    let subject = common::key();
+    let vfs = register(url, &subject, Cache::Browser).await;
+    let conn = open(&vfs);
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+        .expect("create");
+    for id in 1..=20 {
+        conn.execute("INSERT INTO t VALUES (?1, 'row')", [id]).expect("insert");
+    }
+    drop(conn);
+    drop(vfs);
+
+    // Deleted by an instance without the local copy, as by the server.
+    let deleter = register(url, &subject, Cache::None).await;
+    deleter.delete_database("db").expect("delete");
+    drop(deleter);
+
+    let vfs = register(url, &subject, Cache::Browser).await;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let err = Connection::open_with_flags_and_vfs("db", flags, vfs.encrypted_name().as_str())
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0)))
+        .expect_err("the database was deleted");
+    assert_eq!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::CannotOpen), "{err}");
+
+    let conn = open(&vfs);
+    let tables: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tables, 0, "the database created anew is empty");
+    assert_eq!(
+        vfs.stats().local_blocks_read,
+        0,
+        "nothing is read from the old local copy"
+    );
+}
+
+#[wasm_bindgen_test]
 async fn delete_removes_database_and_indexeddb_copy() {
     let Some(url) = SERVER else { return };
     let subject = common::key();

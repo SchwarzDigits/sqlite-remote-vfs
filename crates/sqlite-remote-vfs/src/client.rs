@@ -47,6 +47,10 @@ impl ClientError {
     pub fn is_lease_held(&self) -> bool {
         matches!(self, Self::Server(e) if e.code() == pb::ErrorCode::LeaseHeld)
     }
+
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Server(e) if e.code() == pb::ErrorCode::NotFound)
+    }
 }
 
 impl fmt::Display for ClientError {

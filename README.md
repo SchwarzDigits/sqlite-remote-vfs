@@ -29,7 +29,12 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   all older ones, so an outdated client cannot overwrite newer data.
 - **Deletion.** `RemoteVfs::delete_database` deletes a database on the server, and its cache. Opened again with
   `SQLITE_OPEN_CREATE`, it comes back empty and may use another page size and another key. A client that held a lease
-  on the deleted database can no longer commit, also not after the database was created anew.
+  on the deleted database can no longer commit, also not after the database was created anew. The server also
+  deletes databases that have not been used for a configurable time (180 days by default). A cache of a deleted
+  database is never used again, also on other devices.
+- **Open errors.** Opening without `SQLITE_OPEN_CREATE` fails with `SQLITE_CANTOPEN` only if the database does not
+  exist, and with `SQLITE_BUSY` if another instance has it open. Other failures, such as an unreachable server, give
+  `SQLITE_IOERR`. An application can therefore tell a database that is not stored from one it cannot reach.
 - **Cache (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
   databases of one key keep their own caches. Reads are served from it without a round trip. It contains only data
   the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale cache is
