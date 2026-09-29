@@ -303,7 +303,10 @@ impl VfsStore for Store {
                         db.close(&mut lock(&data.server().client));
                         // In a browser the cache store exists once per VFS. Hand it back for the next database.
                         #[cfg(target_arch = "wasm32")]
-                        if let Some(store) = db.take_local() {
+                        if let Some(mut store) = db.take_local() {
+                            // The connection worker confirms cache writes before it stores them. Wait for them, so
+                            // that another VFS that opens the database next finds the cache complete.
+                            let _ = store.flush();
                             *lock(&data.server().browser_cache) = Some(store);
                         }
                     }

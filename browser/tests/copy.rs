@@ -57,6 +57,49 @@ fn count(conn: &Connection) -> i64 {
 }
 
 #[wasm_bindgen_test]
+async fn large_blocks_are_preloaded_from_the_local_copy() {
+    let Some(url) = SERVER else { return };
+    let subject = common::key();
+    // With 8192-byte blocks, 256 blocks do not fit the bridge buffer of 2 MiB, so the copy must be read in smaller
+    // pieces.
+    let configure = || {
+        let mut config = common::config(url, &subject, Cache::Browser);
+        config.takeover = true;
+        config.load = Load::Preload;
+        config.page_size = 8192;
+        config
+    };
+    let vfs = RemoteVfs::register_async(&unique("vfs"), configure())
+        .await
+        .expect("register the VFS");
+    let conn = open(&vfs);
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)")
+        .expect("create");
+    conn.execute_batch("BEGIN").expect("begin");
+    for id in 1..=3000 {
+        conn.execute("INSERT INTO t VALUES (?1, randomblob(1000))", [id])
+            .expect("insert");
+    }
+    conn.execute_batch("COMMIT").expect("commit");
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0)).unwrap();
+    assert!(
+        pages > 256,
+        "the database must exceed one bridge buffer, has {pages} pages"
+    );
+    drop(conn);
+    drop(vfs);
+
+    let again = RemoteVfs::register_async(&unique("vfs"), configure())
+        .await
+        .expect("register the VFS");
+    let conn = open(&again);
+    assert_eq!(count(&conn), 3000);
+    let stats = again.stats();
+    assert_eq!(stats.fetches, 0, "the local copy holds every block: {stats:?}");
+    assert_eq!(stats.local_blocks_read, pages as u64, "{stats:?}");
+}
+
+#[wasm_bindgen_test]
 async fn current_local_copy_avoids_fetches() {
     let Some(url) = SERVER else { return };
     let subject = common::key();

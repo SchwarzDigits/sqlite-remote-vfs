@@ -348,10 +348,10 @@ impl Remote {
             return Ok(false);
         }
         // Read in chunks: in a browser, blocks are transferred through the fixed-size bridge buffer.
-        const AT_ONCE: u64 = 256;
+        let at_once = crate::local::blocks_per_read(pages.page_size());
         let mut first = 0;
         while first < pages.page_count() {
-            let count = AT_ONCE.min(pages.page_count() - first);
+            let count = at_once.min(pages.page_count() - first);
             let read = match self.local.read(first, count) {
                 Ok(read) => read,
                 Err(_) => {
@@ -450,6 +450,7 @@ impl Remote {
             return false;
         }
         stats.local_reads += 1;
+        let count = count.min(crate::local::blocks_per_read(pages.page_size()));
         let read = match self.local.read(first, count) {
             Ok(read) => read,
             Err(_) => {

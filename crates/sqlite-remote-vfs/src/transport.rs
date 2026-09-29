@@ -265,6 +265,7 @@ mod imp {
     const OP_COPY_CLEAR: i32 = 8;
     const OP_COPY_FORGET: i32 = 9;
     const OP_COPY_SELECT: i32 = 10;
+    const OP_COPY_FLUSH: i32 = 16;
     const OP_LOCAL_OPEN: i32 = 11;
     const OP_LOCAL_READ: i32 = 12;
     const OP_LOCAL_COMMIT: i32 = 13;
@@ -619,6 +620,13 @@ mod imp {
 
         fn clear(&mut self) -> Result<(), String> {
             match self.0.ask(OP_COPY_CLEAR, 0)? {
+                (KIND_DONE, _) => Ok(()),
+                _ => Err(self.0.answer_text()),
+            }
+        }
+
+        fn flush(&mut self) -> Result<(), String> {
+            match self.0.ask(OP_COPY_FLUSH, 0)? {
                 (KIND_DONE, _) => Ok(()),
                 _ => Err(self.0.answer_text()),
             }

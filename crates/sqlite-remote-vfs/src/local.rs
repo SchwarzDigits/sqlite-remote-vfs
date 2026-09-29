@@ -53,6 +53,19 @@ pub(crate) trait LocalStore: AcrossThreads {
     fn select(&mut self, _db_id: &str) -> Result<(), String> {
         Ok(())
     }
+
+    /// Waits until all writes are stored. In a browser the connection worker confirms writes before it stores them.
+    #[cfg(target_arch = "wasm32")]
+    fn flush(&mut self) -> Result<(), String>;
+}
+
+/// Largest number of bytes read from a local copy at once. In a browser the blocks pass through the bridge buffer of
+/// 2 MiB; a read that does not fit it would be cut off and treated as a gap.
+const MAX_READ_BYTES: u64 = 1 << 20;
+
+/// Number of blocks of `page_size` bytes read from a local copy at once.
+pub(crate) fn blocks_per_read(page_size: usize) -> u64 {
+    (MAX_READ_BYTES / page_size.max(1) as u64).max(1)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -45,6 +45,7 @@ const OP_COPY_WRITE = 7;
 const OP_COPY_CLEAR = 8;
 const OP_COPY_FORGET = 9;
 const OP_COPY_SELECT = 10;
+const OP_COPY_FLUSH = 16;
 // Local database operations, for a VFS without a server.
 const OP_LOCAL_OPEN = 11;
 const OP_LOCAL_READ = 12;
@@ -221,11 +222,14 @@ function work() {
           put(KIND_NOTHING, null);
           return;
         }
+        // The SQLite worker asks for no more than fits the answer region. Should it ask for more, return fewer
+        // blocks instead of cutting the last one off.
         const size = blocks[0].length;
-        const bytes = new Uint8Array(4 + size * blocks.length);
+        const fit = blocks.slice(0, Math.max(1, Math.floor((answer.length - 4) / size)));
+        const bytes = new Uint8Array(4 + size * fit.length);
         new DataView(bytes.buffer).setUint32(0, size, true);
         let at = 4;
-        for (const block of blocks) {
+        for (const block of fit) {
           bytes.set(block, at);
           at += size;
         }
@@ -317,6 +321,11 @@ function work() {
       });
       break;
     }
+
+    // Answers when all earlier local copy jobs, including the writes answered in advance, are done.
+    case OP_COPY_FLUSH:
+      queue(async () => put(KIND_DONE, null));
+      break;
 
     // Request: flags (u32: 1 create, 2 take over), page size (u32), name. Answer: page size (u32), page count (u64),
     // epoch (u64).
