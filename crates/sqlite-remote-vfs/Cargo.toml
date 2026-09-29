@@ -15,6 +15,8 @@ prost = "0.14"
 sqlite-remote-protocol = { version = "0.1.0", path = "../sqlite-remote-protocol" }
 rsqlite-vfs = "0.2"
 sha2 = { version = "0.10", default-features = false }
+# Clears the access token from memory when it is dropped.
+zeroize = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

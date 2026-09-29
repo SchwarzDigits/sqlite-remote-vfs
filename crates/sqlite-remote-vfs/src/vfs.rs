@@ -108,8 +108,8 @@ enum Db {
 }
 
 impl MainFile {
-    /// Commits the transaction. On failure, SQLite gets `SQLITE_IOERR_FSYNC`, or `SQLITE_FULL` if the storage quota
-    /// is exhausted, and rolls back, as on a failing disk.
+    /// Commits the transaction. On failure, SQLite gets `SQLITE_IOERR_FSYNC`, `SQLITE_FULL` if the storage quota is
+    /// exhausted, or `SQLITE_AUTH` if the server rejects the access token, and rolls back, as on a failing disk.
     fn commit(&mut self) -> Result<(), Broken> {
         match &mut self.db {
             Db::Server(db) => {
@@ -368,6 +368,7 @@ impl SQLiteIoMethods for Io {
             Ok(()) => SQLITE_OK,
             #[cfg(target_arch = "wasm32")]
             Err(Broken::Full(_)) => rsqlite_vfs::ffi::SQLITE_FULL,
+            Err(Broken::Denied(_)) => rsqlite_vfs::ffi::SQLITE_AUTH,
             Err(_) => SQLITE_IOERR_FSYNC,
         }
     }
@@ -433,32 +434,36 @@ fn cache_store(data: &AppData, name: &str) -> Option<Box<dyn crate::local::Local
 }
 
 /// Deletes a database. Fails if the database is open on this VFS.
-pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), String> {
+pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), crate::Error> {
     // Held throughout, so that the database cannot be opened while it is being deleted.
     let files = lock(&data.files);
     if files.database.as_deref() == Some(name) {
-        return Err(format!("{name} is open; close it before deleting it"));
+        return Err(crate::Error::new(format!(
+            "{name} is open; close it before deleting it"
+        )));
     }
     match &data.backend {
         Backend::Server(_) => delete_on_server(data, name),
         #[cfg(target_arch = "wasm32")]
         Backend::Local(bridge) => bridge
             .delete(name, data.config.takeover)
-            .map_err(|refusal| format!("deleting {name}: {refusal}")),
+            .map_err(|refusal| crate::Error::new(format!("deleting {name}: {refusal}"))),
     }
 }
 
 /// Deletes a database on the page server, then its cache if the cache belongs to it.
-fn delete_on_server(data: &AppData, name: &str) -> Result<(), String> {
+fn delete_on_server(data: &AppData, name: &str) -> Result<(), crate::Error> {
     let server = data.server();
     {
         let mut client = lock(&server.client);
         if !client.is_connected() {
-            client.reconnect().map_err(|err| err.to_string())?;
+            client
+                .reconnect()
+                .map_err(|err| crate::Error::client("connecting", err))?;
         }
         client
             .delete(name, data.config.takeover)
-            .map_err(|err| format!("deleting {name}: {err}"))?;
+            .map_err(|err| crate::Error::client(&format!("deleting {name}"), err))?;
     }
 
     let Some(mut store) = cache_store(data, name) else {
@@ -474,14 +479,18 @@ fn delete_on_server(data: &AppData, name: &str) -> Result<(), String> {
     {
         *lock(&server.browser_cache) = Some(store);
     }
-    result.map_err(|err| format!("{name} was deleted on the server, but its cache was not: {err}"))
+    result.map_err(|err| {
+        crate::Error::new(format!(
+            "{name} was deleted on the server, but its cache was not: {err}"
+        ))
+    })
 }
 
 /// Opens the database on the page server or locally. Fails if this VFS already has a database open.
 ///
-/// SQLite gets `SQLITE_CANTOPEN` only if the database does not exist and `create` is false, and `SQLITE_BUSY` if
-/// another instance has it open. Every other failure, e.g. of the connection, is `SQLITE_IOERR`, so that an
-/// application can tell a missing database from one it cannot reach.
+/// SQLite gets `SQLITE_CANTOPEN` only if the database does not exist and `create` is false, `SQLITE_BUSY` if another
+/// instance has it open, and `SQLITE_AUTH` if the server rejects the access token. Every other failure, e.g. of the
+/// connection, is `SQLITE_IOERR`, so that an application can tell a missing database from one it cannot reach.
 fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Db> {
     let mut files = lock(&data.files);
     if let Some(open) = &files.database {
@@ -518,9 +527,14 @@ fn cap(config: &Config) -> Option<u64> {
 fn open_on_server(data: &AppData, server: &ServerBackend, name: &str, create: bool) -> VfsResult<Database> {
     let mut client = lock(&server.client);
     if !client.is_connected() {
-        client
-            .reconnect()
-            .map_err(|err| io_error(VfsErrorCode::Io, err.to_string()))?;
+        client.reconnect().map_err(|err| {
+            let code = if err.is_access_denied() {
+                VfsErrorCode::Auth
+            } else {
+                VfsErrorCode::Io
+            };
+            io_error(code, err.to_string())
+        })?;
     }
     let options = OpenOptions {
         page_size: data.config.page_size,

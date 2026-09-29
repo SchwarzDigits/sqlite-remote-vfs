@@ -25,6 +25,11 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   can only open databases under its own subject. The VFS holds no key material. Supported algorithm: Ed25519.
   The signature is not bound to the connection, so a server the client connects to could relay another server's
   challenge. Use a separate key for each server.
+- **Access tokens (optional).** For a server that admits only clients with a token from a token service, set
+  `Server::token` to a `TokenSource`. The VFS asks it for a token before every login and sends it in the `Hello`;
+  the token is opaque to the VFS. If the server rejects the token, the VFS asks once more. It reconnects with a new
+  token before the old one expires, between two requests, and resumes its databases. A rejected token fails the
+  registration with `Error::is_access_denied()`, and a later open or commit with `SQLITE_AUTH`.
 - **One writer per database.** Opening a database acquires a lease. A newer lease has a higher epoch and fences off
   all older ones, so an outdated client cannot overwrite newer data.
 - **Deletion.** `RemoteVfs::delete_database` deletes a database on the server, and its cache. Opened again with
@@ -198,6 +203,7 @@ in-memory store and a PostgreSQL store.
 ## Not there yet
 
 - One database per registered VFS, one connection per database.
+- The C interface does not pass access tokens yet.
 - Recovery after the server was restored from a backup: a client that has seen commits the restored server no
   longer has is not handled yet. The protocol reserves a field number for it.
 

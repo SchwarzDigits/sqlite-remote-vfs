@@ -14,6 +14,9 @@ use crate::platform::Moment;
 use crate::transport::{Transport, dial};
 
 pub(crate) const PROTOCOL_VERSION: u32 = 1;
+/// The client reconnects with a new access token this long before the old one expires, or after half its lifetime
+/// if that is shorter.
+const TOKEN_RENEWAL_MARGIN: Duration = Duration::from_secs(30);
 
 // `url` and `timeout` are only used for dialling. In a browser the connection worker dials, and the client reaches it
 // through the bridge.
@@ -22,6 +25,7 @@ pub(crate) const PROTOCOL_VERSION: u32 = 1;
 pub(crate) struct ClientConfig {
     pub url: String,
     pub signer: std::sync::Arc<dyn crate::Signer>,
+    pub token: Option<std::sync::Arc<dyn crate::TokenSource>>,
     pub instance_id: [u8; 16],
     pub timeout: Duration,
     pub trace_fetches: bool,
@@ -37,6 +41,8 @@ pub(crate) enum ClientError {
     Server(pb::Error),
     /// The server sent a response that does not match the request.
     Protocol(String),
+    /// The token source returned no access token.
+    Token(String),
 }
 
 impl ClientError {
@@ -51,6 +57,11 @@ impl ClientError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Server(e) if e.code() == pb::ErrorCode::NotFound)
     }
+
+    /// The server rejected the access token, or the token source returned none.
+    pub fn is_access_denied(&self) -> bool {
+        matches!(self, Self::Server(e) if e.code() == pb::ErrorCode::AccessDenied) || matches!(self, Self::Token(_))
+    }
 }
 
 impl fmt::Display for ClientError {
@@ -59,6 +70,7 @@ impl fmt::Display for ClientError {
             Self::Transport(reason) => write!(f, "connection: {reason}"),
             Self::Server(e) => write!(f, "server: {}: {}", e.code().as_str_name(), e.detail),
             Self::Protocol(reason) => write!(f, "protocol: {reason}"),
+            Self::Token(reason) => write!(f, "access token: {reason}"),
         }
     }
 }
@@ -87,6 +99,9 @@ pub(crate) struct Client {
     last_request: Moment,
     /// Databases whose lease the server revoked because another instance took it over.
     revoked: HashSet<String>,
+    /// Time from which the connection counts as broken, so that the next request reconnects with a new access token
+    /// before the server closes the connection. `None` without a token.
+    token_renewal: Option<Moment>,
     /// Block ranges of all fetches, if `trace_fetches` is set in the configuration.
     trace: Option<Vec<(u64, u64)>>,
 }
@@ -106,6 +121,7 @@ impl Client {
             next_id: 0,
             last_request: Moment::now(),
             revoked: HashSet::new(),
+            token_renewal: None,
             trace: config_trace,
         };
         client.reconnect()?;
@@ -128,9 +144,10 @@ impl Client {
             next_id: 0,
             last_request: Moment::now(),
             revoked: HashSet::new(),
+            token_renewal: None,
             trace,
         };
-        client.say_hello()?;
+        client.log_in()?;
         Ok(client)
     }
 
@@ -138,7 +155,16 @@ impl Client {
         self.limits
     }
 
+    /// Whether the connection is usable. It is not once the access token is due for renewal: the callers then
+    /// reconnect and resume their databases, as after a broken connection.
     pub fn is_connected(&self) -> bool {
+        self.is_open() && !self.token_renewal.is_some_and(|due| Moment::now() >= due)
+    }
+
+    /// Whether the connection is open, also if the access token is due for renewal. The server accepts pings with an
+    /// expired token, so the leases stay renewed until the next request reconnects. Only the native ping thread asks.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    pub fn is_open(&self) -> bool {
         self.connected && self.socket.is_some()
     }
 
@@ -163,23 +189,46 @@ impl Client {
 
     /// Opens a new connection and logs in. Databases opened on the old connection must be resumed.
     pub fn reconnect(&mut self) -> Result<(), ClientError> {
+        self.open_socket()?;
+        self.log_in()
+    }
+
+    fn open_socket(&mut self) -> Result<(), ClientError> {
         match &mut self.socket {
             Some(socket) => socket.reopen().map_err(ClientError::Transport)?,
             None => self.socket = Some(dial(&self.config).map_err(ClientError::Transport)?),
         }
         self.connected = true;
-        self.say_hello()
+        Ok(())
+    }
+
+    /// Logs in on the open connection. If the server rejects the access token, asks the token source for a new one
+    /// and tries once more: the token may have expired just before the login.
+    fn log_in(&mut self) -> Result<(), ClientError> {
+        match self.say_hello() {
+            Err(err) if err.is_access_denied() && self.config.token.is_some() => {
+                // The server closes the connection after rejecting a token.
+                self.open_socket()?;
+                self.say_hello()
+            }
+            result => result,
+        }
     }
 
     /// Logs in on a new connection: sends `Hello`, signs the challenge, and stores the limits from `HelloOk`.
     fn say_hello(&mut self) -> Result<(), ClientError> {
         let signer = std::sync::Arc::clone(&self.config.signer);
         let public_key = signer.public_key();
+        let access_token = match &self.config.token {
+            Some(source) => source.token().map_err(ClientError::Token)?,
+            None => zeroize::Zeroizing::new(String::new()),
+        };
         let hello = client_frame::Body::Hello(pb::Hello {
             protocol_version: PROTOCOL_VERSION,
             instance_id: self.config.instance_id.to_vec(),
             sig_alg: crate::identity::wire_algorithm(signer.algorithm()),
             public_key: public_key.clone(),
+            access_token: access_token.to_string(),
         });
         // Refuse a server that does not send a challenge: it would accept any client under any subject.
         let challenge = match self.call(hello)? {
@@ -207,6 +256,9 @@ impl Client {
                     max_frame_bytes: ok.max_frame_bytes,
                     ping_interval: Duration::from_millis(ok.ping_interval_ms.into()),
                 };
+                let ttl = Duration::from_millis(ok.access_token_ttl_ms);
+                self.token_renewal =
+                    (!ttl.is_zero()).then(|| Moment::now().plus(ttl - TOKEN_RENEWAL_MARGIN.min(ttl / 2)));
                 Ok(())
             }
             other => Err(ClientError::Protocol(format!("expected HelloOk, got {other:?}"))),

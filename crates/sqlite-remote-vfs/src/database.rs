@@ -31,6 +31,8 @@ pub(crate) enum Broken {
     Uncertain(String),
     /// The server rejected a commit, or a fetch failed. Locally: IndexedDB failed.
     Refused(String),
+    /// The server rejected the access token when the client reconnected. SQLite gets `SQLITE_AUTH` for a commit.
+    Denied(String),
     /// Locally: the browser's storage quota is exhausted. SQLite gets `SQLITE_FULL`.
     #[cfg(target_arch = "wasm32")]
     Full(String),
@@ -287,7 +289,10 @@ impl Source for Fetch<'_> {
             // Reads reconnect once, without a deadline. If that fails, the read fails.
             remote
                 .resume(self.client, pages.page_size(), stats)
-                .map_err(|err| remote.break_with(Broken::Uncertain(err.to_string())))?;
+                .map_err(|err| match err {
+                    err if err.is_access_denied() => remote.break_with(Broken::Denied(err.to_string())),
+                    err => remote.break_with(Broken::Uncertain(err.to_string())),
+                })?;
         }
         remote
             .load(self.client, pages, first, count, stats)
@@ -607,6 +612,8 @@ impl Remote {
             match self.resume(client, page_size, stats) {
                 Ok(opened) => return Ok(opened),
                 Err(err) if err.is_fenced() => return Err(self.break_with(Broken::Fenced)),
+                // Not transient: the client has already asked the token source again.
+                Err(err) if err.is_access_denied() => return Err(self.break_with(Broken::Denied(err.to_string()))),
                 Err(err) if Moment::now() >= deadline => {
                     return Err(self.break_with(Broken::Uncertain(format!("no connection to the server: {err}"))));
                 }

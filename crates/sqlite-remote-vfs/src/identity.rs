@@ -55,6 +55,21 @@ pub trait Signer: Shared {
     fn sign(&self, message: &[u8]) -> Vec<u8>;
 }
 
+/// Supplies the access token for a server that admits only clients with one. See [`crate::Server::token`].
+pub trait TokenSource: Shared {
+    /// Returns a valid access token. The VFS calls this before every login, also when it reconnects, and once more
+    /// if the server rejects the token. SQLite waits during the call, so it should return a cached token that is
+    /// refreshed in advance. The token is opaque to the VFS.
+    fn token(&self) -> Result<zeroize::Zeroizing<String>, String>;
+}
+
+impl fmt::Debug for dyn TokenSource {
+    /// Prints no token.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TokenSource")
+    }
+}
+
 /// Returns the subject the server derives from the signer's public key. The server stores the databases under it.
 ///
 /// The subject is not secret. It identifies the databases but does not grant access to them.

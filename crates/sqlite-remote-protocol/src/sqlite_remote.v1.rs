@@ -72,7 +72,8 @@ pub mod server_frame {
         Changes(super::Changes),
     }
 }
-/// First frame on a connection. The server answers with a `Challenge`, or with an `Error` if the frame is invalid.
+/// First frame on a connection. The server answers with a `Challenge`, or with an `Error` if the frame is invalid or
+/// the access token is rejected.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Hello {
     /// Protocol version of the client. The server rejects a version other than its own with ERROR_CODE_BAD_REQUEST.
@@ -86,9 +87,16 @@ pub struct Hello {
     /// connection can access. A client has no other way to select a subject.
     #[prost(enumeration = "SigAlg", tag = "3")]
     pub sig_alg: i32,
-    /// 5 and 6 are reserved for an enrolment token and a second signature algorithm.
     #[prost(bytes = "vec", tag = "4")]
     pub public_key: ::prost::alloc::vec::Vec<u8>,
+    /// Access token, for a server that admits only clients with one. A signed JWT whose `cnf` claim binds it to
+    /// `public_key`, so that it is useless without the private key. The server checks it before the `Challenge` and
+    /// rejects a missing, invalid or expired token, or one bound to another key, with ERROR_CODE_ACCESS_DENIED. A server
+    /// without such a requirement ignores the field. See `HelloOk.access_token_ttl_ms`.
+    ///
+    /// 6 is reserved for a second signature algorithm.
+    #[prost(string, tag = "5")]
+    pub access_token: ::prost::alloc::string::String,
 }
 /// Answer to `Hello`, with the Hello's request_id. The client answers with a `Proof`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -136,6 +144,11 @@ pub struct HelloOk {
     /// milliseconds. Commits and pings renew the lease.
     #[prost(uint32, tag = "4")]
     pub lease_ttl_ms: u32,
+    /// Remaining lifetime of the access token in milliseconds, 0 without a token. Relative, so that the clocks of client
+    /// and server need not agree. The client reconnects with a new token before this time has passed, between two
+    /// requests. Shortly after it has passed, the server closes the connection at the next frame.
+    #[prost(uint64, tag = "5")]
+    pub access_token_ttl_ms: u64,
 }
 /// Opens a database and acquires its lease, the exclusive right to commit to it. Answered with `Opened`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -436,6 +449,9 @@ pub enum ErrorCode {
     RateLimited = 10,
     /// Unexpected error on the server. Details are only in the server's log.
     Internal = 11,
+    /// The server requires an access token (`Hello.access_token`), and the token is missing, invalid, expired, or bound
+    /// to another key.
+    AccessDenied = 12,
 }
 impl ErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -456,6 +472,7 @@ impl ErrorCode {
             Self::QuotaExceeded => "ERROR_CODE_QUOTA_EXCEEDED",
             Self::RateLimited => "ERROR_CODE_RATE_LIMITED",
             Self::Internal => "ERROR_CODE_INTERNAL",
+            Self::AccessDenied => "ERROR_CODE_ACCESS_DENIED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -473,6 +490,7 @@ impl ErrorCode {
             "ERROR_CODE_QUOTA_EXCEEDED" => Some(Self::QuotaExceeded),
             "ERROR_CODE_RATE_LIMITED" => Some(Self::RateLimited),
             "ERROR_CODE_INTERNAL" => Some(Self::Internal),
+            "ERROR_CODE_ACCESS_DENIED" => Some(Self::AccessDenied),
             _ => None,
         }
     }

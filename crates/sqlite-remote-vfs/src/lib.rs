@@ -41,9 +41,10 @@ use std::time::Duration;
 
 use rsqlite_vfs::{register_vfs, registered_vfs};
 
-pub use crate::identity::{Algorithm, Shared, Signer, subject};
+pub use crate::identity::{Algorithm, Shared, Signer, TokenSource, subject};
+pub use zeroize::Zeroizing;
 
-use crate::client::{Client, ClientConfig};
+use crate::client::{Client, ClientConfig, ClientError};
 use crate::vfs::{Backend, Files, Inner, Io, ServerBackend, Vfs, lock};
 
 /// When blocks are loaded from the server.
@@ -119,6 +120,9 @@ pub struct Server {
     pub url: String,
     /// Signer for the login. The server derives the subject that owns the databases from its public key.
     pub signer: Arc<dyn Signer>,
+    /// Access token source, for a server that admits only clients with a token. `None` sends no token. A rejected
+    /// token fails the registration with [`Error::is_access_denied`], and a database operation with `SQLITE_AUTH`.
+    pub token: Option<Arc<dyn TokenSource>>,
     /// Identifier of this client instance. Random if `None`.
     pub instance_id: Option<[u8; 16]>,
     /// Optional cache on this device. It may be incomplete: blocks it does not have are fetched from the server and
@@ -137,11 +141,13 @@ pub struct Server {
 }
 
 impl Server {
-    /// Returns server settings with the defaults: no cache, a random instance identifier, 10 s reconnect timeout.
+    /// Returns server settings with the defaults: no access token, no cache, a random instance identifier, 10 s
+    /// reconnect timeout.
     pub fn new(url: impl Into<String>, signer: Arc<dyn Signer>) -> Self {
         Server {
             url: url.into(),
             signer,
+            token: None,
             instance_id: None,
             cache: Cache::None,
             reconnect_timeout: Duration::from_secs(10),
@@ -239,11 +245,36 @@ pub struct Stats {
 
 /// Error returned when registering a VFS or deleting a database fails.
 #[derive(Debug)]
-pub struct Error(String);
+pub struct Error {
+    message: String,
+    access_denied: bool,
+}
+
+impl Error {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Error {
+            message: message.into(),
+            access_denied: false,
+        }
+    }
+
+    /// An error of the client, prefixed with `context`.
+    pub(crate) fn client(context: &str, err: ClientError) -> Self {
+        Error {
+            message: format!("{context}: {err}"),
+            access_denied: err.is_access_denied(),
+        }
+    }
+
+    /// Whether the server rejected the access token, or the [`TokenSource`] returned none.
+    pub fn is_access_denied(&self) -> bool {
+        self.access_denied
+    }
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -263,10 +294,10 @@ impl RemoteVfs {
         let settings = match &config.store {
             Store::Server(settings) => settings.clone(),
             #[cfg(target_arch = "wasm32")]
-            Store::Local { .. } => return Err(Error("local databases need RemoteVfs::register_async".into())),
+            Store::Local { .. } => return Err(Error::new("local databases need RemoteVfs::register_async")),
         };
         let client_config = client_config(&settings, config.timeout);
-        let client = Client::connect(client_config).map_err(|err| Error(format!("{}: {err}", settings.url)))?;
+        let client = Client::connect(client_config).map_err(|err| Error::client(&settings.url, err))?;
         Self::finish(name, config, server_backend(settings, client, None))
     }
 
@@ -284,20 +315,20 @@ impl RemoteVfs {
                 let url = settings.url.clone();
                 let (transport, cache) = crate::transport::start(&client_config)
                     .await
-                    .map_err(|err| Error(format!("{url}: {err}")))?;
+                    .map_err(|err| Error::new(format!("{url}: {err}")))?;
                 let client =
-                    Client::with_transport(transport, client_config).map_err(|err| Error(format!("{url}: {err}")))?;
+                    Client::with_transport(transport, client_config).map_err(|err| Error::client(&url, err))?;
                 Self::finish(name, config, server_backend(settings, client, Some(cache)))
             }
             Store::Local { namespace } => {
                 if namespace.is_empty() || namespace.contains('/') {
-                    return Err(Error(format!(
+                    return Err(Error::new(format!(
                         "invalid namespace {namespace:?}: it must not be empty or contain '/'"
                     )));
                 }
                 let bridge = crate::transport::start_local(namespace, config.timeout)
                     .await
-                    .map_err(Error)?;
+                    .map_err(Error::new)?;
                 Self::finish(name, config, Backend::Local(bridge))
             }
         }
@@ -319,7 +350,7 @@ impl RemoteVfs {
         // `into_raw` keeps the VFS registered for the rest of the process, because SQLite may still hold open files.
         // The app data therefore outlives every open file.
         unsafe { register_vfs::<Io, Vfs>(name, Arc::clone(&inner), false) }
-            .map_err(|err| Error(err.to_string()))?
+            .map_err(|err| Error::new(err.to_string()))?
             .into_raw();
         spawn_pinger(Arc::clone(&inner));
         Ok(RemoteVfs {
@@ -360,7 +391,7 @@ impl RemoteVfs {
     /// no longer commit. Deleting a database that does not exist succeeds. Opening `name` again with
     /// `SQLITE_OPEN_CREATE` creates it empty, and it may then use another page size and another key.
     pub fn delete_database(&self, name: &str) -> Result<(), Error> {
-        crate::vfs::delete_database(&self.inner, name).map_err(Error)
+        crate::vfs::delete_database(&self.inner, name)
     }
 
     /// Marks the connection to the server as broken, as after a network failure. The next request reconnects. For
@@ -387,10 +418,10 @@ fn check_name(name: &str) -> Result<(), Error> {
     // SAFETY: the lookup only reads SQLite's list of VFSes. The caller registers a VFS once, from one thread, so the
     // lookup does not run concurrently with a registration.
     if unsafe { registered_vfs(name) }
-        .map_err(|err| Error(err.to_string()))?
+        .map_err(|err| Error::new(err.to_string()))?
         .is_some()
     {
-        return Err(Error(format!("a VFS named {name} is already registered")));
+        return Err(Error::new(format!("a VFS named {name} is already registered")));
     }
     Ok(())
 }
@@ -405,6 +436,7 @@ fn client_config(settings: &Server, timeout: Duration) -> ClientConfig {
     ClientConfig {
         url: settings.url.clone(),
         signer: Arc::clone(&settings.signer),
+        token: settings.token.clone(),
         instance_id,
         timeout,
         trace_fetches: settings.trace_fetches,
@@ -436,7 +468,7 @@ fn spawn_pinger(inner: Arc<Inner>) {
                 let interval = lock(&server.client).limits().ping_interval;
                 platform::sleep(interval / 2);
                 let mut client = lock(&server.client);
-                if client.is_connected() && client.idle_for() >= interval / 2 {
+                if client.is_open() && client.idle_for() >= interval / 2 {
                     let now = platform::epoch_millis().max(0) as u64;
                     // A failed ping marks the connection as broken. The next commit reconnects and resumes the
                     // databases.

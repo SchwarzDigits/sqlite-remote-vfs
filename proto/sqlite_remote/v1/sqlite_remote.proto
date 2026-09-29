@@ -47,7 +47,8 @@ message ServerFrame {
   }
 }
 
-// First frame on a connection. The server answers with a `Challenge`, or with an `Error` if the frame is invalid.
+// First frame on a connection. The server answers with a `Challenge`, or with an `Error` if the frame is invalid or
+// the access token is rejected.
 message Hello {
   // Protocol version of the client. The server rejects a version other than its own with ERROR_CODE_BAD_REQUEST.
   uint32 protocol_version = 1;
@@ -58,7 +59,12 @@ message Hello {
   // connection can access. A client has no other way to select a subject.
   SigAlg sig_alg = 3;
   bytes public_key = 4;
-  // 5 and 6 are reserved for an enrolment token and a second signature algorithm.
+  // Access token, for a server that admits only clients with one. A signed JWT whose `cnf` claim binds it to
+  // `public_key`, so that it is useless without the private key. The server checks it before the `Challenge` and
+  // rejects a missing, invalid or expired token, or one bound to another key, with ERROR_CODE_ACCESS_DENIED. A server
+  // without such a requirement ignores the field. See `HelloOk.access_token_ttl_ms`.
+  string access_token = 5;
+  // 6 is reserved for a second signature algorithm.
 
   // Previously a subject chosen by the client. Must not be reused: it would let any client claim any subject.
   reserved 20;
@@ -108,6 +114,10 @@ message HelloOk {
   // Time after the last renewal from which another instance can acquire the lease without `takeover`, in
   // milliseconds. Commits and pings renew the lease.
   uint32 lease_ttl_ms = 4;
+  // Remaining lifetime of the access token in milliseconds, 0 without a token. Relative, so that the clocks of client
+  // and server need not agree. The client reconnects with a new token before this time has passed, between two
+  // requests. Shortly after it has passed, the server closes the connection at the next frame.
+  uint64 access_token_ttl_ms = 5;
 }
 
 // Opens a database and acquires its lease, the exclusive right to commit to it. Answered with `Opened`.
@@ -325,4 +335,7 @@ enum ErrorCode {
   ERROR_CODE_RATE_LIMITED = 10;
   // Unexpected error on the server. Details are only in the server's log.
   ERROR_CODE_INTERNAL = 11;
+  // The server requires an access token (`Hello.access_token`), and the token is missing, invalid, expired, or bound
+  // to another key.
+  ERROR_CODE_ACCESS_DENIED = 12;
 }

@@ -20,6 +20,8 @@ const INSTANCE_ID: [u8; 16] = [0x01; 16];
 const LEASE_ID: [u8; 16] = [0xaa; 16];
 const PREVIOUS_COMMIT_ID: [u8; 16] = [0xbb; 16];
 const PUBLIC_KEY: [u8; 32] = [0x7e; 32];
+// Shaped like a JWT. The protocol treats the token as an opaque string.
+const ACCESS_TOKEN: &str = "eyJhbGciOiJFZERTQSIsImtpZCI6ImsxIn0.eyJzdWIiOiJhbGljZSJ9.c2lnbmF0dXJl";
 const NONCE: [u8; 32] = [0x5c; 32];
 const SIGNATURE: [u8; 64] = [0x3f; 64];
 const COMMIT_ID: [u8; 16] = [0xcc; 16];
@@ -75,6 +77,20 @@ fn samples() -> Vec<(&'static str, Frame)> {
                     instance_id: INSTANCE_ID.to_vec(),
                     sig_alg: SigAlg::Ed25519 as i32,
                     public_key: PUBLIC_KEY.to_vec(),
+                    access_token: String::new(),
+                }),
+            ),
+        ),
+        (
+            "client_hello_token",
+            client(
+                1,
+                C::Hello(Hello {
+                    protocol_version: 1,
+                    instance_id: INSTANCE_ID.to_vec(),
+                    sig_alg: SigAlg::Ed25519 as i32,
+                    public_key: PUBLIC_KEY.to_vec(),
+                    access_token: ACCESS_TOKEN.into(),
                 }),
             ),
         ),
@@ -107,6 +123,20 @@ fn samples() -> Vec<(&'static str, Frame)> {
                     max_frame_bytes: 1_048_576,
                     ping_interval_ms: 10_000,
                     lease_ttl_ms: 30_000,
+                    access_token_ttl_ms: 0,
+                }),
+            ),
+        ),
+        (
+            "server_hello_ok_token",
+            server(
+                2,
+                S::HelloOk(HelloOk {
+                    protocol_version: 1,
+                    max_frame_bytes: 1_048_576,
+                    ping_interval_ms: 10_000,
+                    lease_ttl_ms: 30_000,
+                    access_token_ttl_ms: 3_540_000,
                 }),
             ),
         ),
@@ -304,6 +334,18 @@ fn samples() -> Vec<(&'static str, Frame)> {
                 S::LeaseRevoked(LeaseRevoked {
                     db_id: DB_ID.into(),
                     new_lease_epoch: 4,
+                }),
+            ),
+        ),
+        (
+            "server_error_access_denied",
+            server(
+                1,
+                S::Error(Error {
+                    code: ErrorCode::AccessDenied.into(),
+                    detail: "access token expired".into(),
+                    current_version: 0,
+                    lease_holder_since_ms: 0,
                 }),
             ),
         ),
