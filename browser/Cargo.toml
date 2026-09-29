@@ -42,3 +42,9 @@ web-sys = { version = "0.3", features = [
 # Separate workspace. The native workspace patches libsqlite3-sys to a vendored copy, which this target does not use,
 # and the rusqlite versions differ.
 [workspace]
+
+# SQLite's C code is compiled with the opt-level of the profile. Unoptimized, sqlite3VdbeExec has about 8,700 wasm
+# locals, and Safari's worker sporadically ran out of stack in the SQLite parser ("Maximum call stack size exceeded").
+# With opt-level 2 it has fewer than 50.
+[profile.dev.package.sqlite-wasm-rs]
+opt-level = 2
