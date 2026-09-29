@@ -14,6 +14,8 @@ js-sys = "0.3"
 rsqlite-vfs = "0.2"
 
 [dev-dependencies]
+# Encodes the access tokens that token.rs signs.
+base64 = "0.22"
 # Signer for the tests. The VFS receives a `Signer` and holds no key material itself.
 ed25519-dalek = { version = "2", default-features = false }
 # SQLite for `wasm32-unknown-unknown`, built with SQLite3 Multiple Ciphers. Pinned, because an application that uses

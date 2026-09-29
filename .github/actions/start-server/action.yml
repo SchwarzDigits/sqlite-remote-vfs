@@ -1,7 +1,7 @@
 name: Start page server
 description: >-
-  Installs sqlite-remote-server at the given commit, starts it in the background and sets SQLITE_REMOTE_TEST_URL for
-  the following steps.
+  Installs sqlite-remote-server at the given commit, starts it in the background and sets the environment variable
+  named in url-variable, by default SQLITE_REMOTE_TEST_URL, to its URL for the following steps.
 inputs:
   version:
     description: Commit or version of github.com/SchwarzDigits/sqlite-remote-server.
@@ -15,6 +15,18 @@ inputs:
   port:
     description: Port to listen on.
     default: "18090"
+  url-variable:
+    description: Environment variable that receives the server's URL.
+    default: SQLITE_REMOTE_TEST_URL
+  token-jwks-file:
+    description: JWKS file, relative to the workspace. If set, the server admits only clients with an access token.
+    default: ""
+  token-issuer:
+    description: Required issuer of access tokens.
+    default: ""
+  token-leeway:
+    description: Allowance for clock differences when checking access tokens, e.g. 1s.
+    default: ""
 runs:
   using: composite
   steps:
@@ -30,22 +42,31 @@ runs:
         STORE: ${{ inputs.store }}
         DATABASE_URL: ${{ inputs.database-url }}
         PORT: ${{ inputs.port }}
+        URL_VARIABLE: ${{ inputs.url-variable }}
+        TOKEN_JWKS_FILE: ${{ inputs.token-jwks-file }}
+        TOKEN_ISSUER: ${{ inputs.token-issuer }}
+        TOKEN_LEEWAY: ${{ inputs.token-leeway }}
       run: |
         go install "github.com/SchwarzDigits/sqlite-remote-server/cmd/sqlite-remote-server@$VERSION"
         url="ws://127.0.0.1:$PORT/v1/ws"
+        jwks=""
+        if [ -n "$TOKEN_JWKS_FILE" ]; then jwks="$GITHUB_WORKSPACE/$TOKEN_JWKS_FILE"; fi
+        log="$RUNNER_TEMP/sqlite-remote-server-$PORT.log"
         # The browser tests load their page from 127.0.0.1 on another port.
         SQLITE_REMOTE_PORT="$PORT" SQLITE_REMOTE_SERVER_ID="$url" SQLITE_REMOTE_STORE="$STORE" \
           SQLITE_REMOTE_DATABASE_URL="$DATABASE_URL" SQLITE_REMOTE_ALLOWED_ORIGINS='127.0.0.1:*,localhost:*' \
-          nohup "$(go env GOPATH)/bin/sqlite-remote-server" > "$RUNNER_TEMP/sqlite-remote-server.log" 2>&1 &
+          SQLITE_REMOTE_TOKEN_JWKS_FILE="$jwks" SQLITE_REMOTE_TOKEN_ISSUER="$TOKEN_ISSUER" \
+          SQLITE_REMOTE_TOKEN_LEEWAY="$TOKEN_LEEWAY" \
+          nohup "$(go env GOPATH)/bin/sqlite-remote-server" > "$log" 2>&1 &
         for _ in $(seq 100); do
           if curl -sf "http://127.0.0.1:$PORT/.well-known/ready" > /dev/null; then
-            echo "SQLITE_REMOTE_TEST_URL=$url" >> "$GITHUB_ENV"
+            echo "$URL_VARIABLE=$url" >> "$GITHUB_ENV"
             exit 0
           fi
           sleep 0.2
         done
         echo "sqlite-remote-server did not become ready:" >&2
-        cat "$RUNNER_TEMP/sqlite-remote-server.log" >&2
+        cat "$log" >&2
         exit 1
     # The same in PowerShell, for Windows runners.
     - name: Install and start sqlite-remote-server (Windows)
@@ -56,14 +77,20 @@ runs:
         STORE: ${{ inputs.store }}
         DATABASE_URL: ${{ inputs.database-url }}
         PORT: ${{ inputs.port }}
+        URL_VARIABLE: ${{ inputs.url-variable }}
+        TOKEN_JWKS_FILE: ${{ inputs.token-jwks-file }}
+        TOKEN_ISSUER: ${{ inputs.token-issuer }}
+        TOKEN_LEEWAY: ${{ inputs.token-leeway }}
       run: |
         go install "github.com/SchwarzDigits/sqlite-remote-server/cmd/sqlite-remote-server@$env:VERSION"
         if ($LASTEXITCODE -ne 0) { exit 1 }
         $url = "ws://127.0.0.1:$env:PORT/v1/ws"
+        $jwks = ''
+        if ($env:TOKEN_JWKS_FILE) { $jwks = Join-Path $env:GITHUB_WORKSPACE $env:TOKEN_JWKS_FILE }
         $exe = Join-Path (go env GOPATH) 'bin\sqlite-remote-server.exe'
-        $log = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.log'
-        $errors = Join-Path $env:RUNNER_TEMP 'sqlite-remote-server.err.log'
-        $script = Join-Path $env:RUNNER_TEMP 'start-sqlite-remote-server.cmd'
+        $log = Join-Path $env:RUNNER_TEMP "sqlite-remote-server-$env:PORT.log"
+        $errors = Join-Path $env:RUNNER_TEMP "sqlite-remote-server-$env:PORT.err.log"
+        $script = Join-Path $env:RUNNER_TEMP "start-sqlite-remote-server-$env:PORT.cmd"
         @(
           '@echo off'
           "set SQLITE_REMOTE_PORT=$env:PORT"
@@ -71,6 +98,9 @@ runs:
           "set SQLITE_REMOTE_STORE=$env:STORE"
           "set SQLITE_REMOTE_DATABASE_URL=$env:DATABASE_URL"
           'set SQLITE_REMOTE_ALLOWED_ORIGINS=127.0.0.1:*,localhost:*'
+          "set SQLITE_REMOTE_TOKEN_JWKS_FILE=$jwks"
+          "set SQLITE_REMOTE_TOKEN_ISSUER=$env:TOKEN_ISSUER"
+          "set SQLITE_REMOTE_TOKEN_LEEWAY=$env:TOKEN_LEEWAY"
           "`"$exe`" > `"$log`" 2> `"$errors`""
         ) | Set-Content -Path $script -Encoding ascii
         # A process started from this step, also with Start-Process, was gone in the next step. A process that WMI
@@ -80,7 +110,7 @@ runs:
         for ($i = 0; $i -lt 100; $i++) {
           curl.exe -sf "http://127.0.0.1:$env:PORT/.well-known/ready" > $null
           if ($LASTEXITCODE -eq 0) {
-            "SQLITE_REMOTE_TEST_URL=$url" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            "$($env:URL_VARIABLE)=$url" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
             exit 0
           }
           Start-Sleep -Milliseconds 200

@@ -17,10 +17,11 @@ env:
   CARGO_TERM_COLOR: always
   # Commit of github.com/SchwarzDigits/sqlite-remote-server that the tests run against. Raised deliberately, after
   # the server's own CI passed.
-  SERVER_VERSION: 6a4bf9cb784c1bea8e7efe6c625f68bc9195b592
+  SERVER_VERSION: 446de6fe3542359ea65340e5b8de14aa71a99d4c
 
 # Every job starts that server with the start-server action, which sets SQLITE_REMOTE_TEST_URL. The tests that need a
-# server skip themselves without it.
+# server skip themselves without it. The native and browser jobs start a second one that admits only clients with an
+# access token (SQLITE_REMOTE_TEST_GATED_URL), for the token tests.
 jobs:
   native:
     name: Native (${{ matrix.os }})
@@ -38,6 +39,14 @@ jobs:
       - uses: ./.github/actions/start-server
         with:
           version: ${{ env.SERVER_VERSION }}
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
+          port: "18091"
+          url-variable: SQLITE_REMOTE_TEST_GATED_URL
+          token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
+          token-issuer: sqlite-remote-vfs-tests
+          token-leeway: 1s
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -173,6 +182,14 @@ jobs:
       - uses: ./.github/actions/start-server
         with:
           version: ${{ env.SERVER_VERSION }}
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
+          port: "18091"
+          url-variable: SQLITE_REMOTE_TEST_GATED_URL
+          token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
+          token-issuer: sqlite-remote-vfs-tests
+          token-leeway: 1s
       # The runner image has llvm-ar only under a versioned name.
       - name: Find llvm-ar
         run: |
@@ -221,6 +238,14 @@ jobs:
       - uses: ./.github/actions/start-server
         with:
           version: ${{ env.SERVER_VERSION }}
+      - uses: ./.github/actions/start-server
+        with:
+          version: ${{ env.SERVER_VERSION }}
+          port: "18091"
+          url-variable: SQLITE_REMOTE_TEST_GATED_URL
+          token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
+          token-issuer: sqlite-remote-vfs-tests
+          token-leeway: 1s
       # Safari only accepts WebDriver sessions after remote automation is enabled. It has no headless mode.
       - name: Enable Safari's WebDriver
         run: sudo safaridriver --enable
