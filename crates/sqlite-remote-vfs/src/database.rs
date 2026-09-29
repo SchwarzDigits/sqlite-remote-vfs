@@ -24,13 +24,16 @@ const MAX_CATCH_UP_RANGES: usize = 4096;
 /// Reason why a database no longer accepts writes. It has to be closed and opened again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Broken {
-    /// Another instance has taken over the lease.
+    /// Another instance has taken over the lease, or locally the lock.
     Fenced,
     /// The state on the server is unknown to this client: the connection could not be restored, or the server is at
-    /// an unexpected version after reconnecting.
+    /// an unexpected version after reconnecting. Locally: the connection worker did not answer in time.
     Uncertain(String),
-    /// The server rejected a commit, or a fetch failed.
+    /// The server rejected a commit, or a fetch failed. Locally: IndexedDB failed.
     Refused(String),
+    /// Locally: the browser's storage quota is exhausted. SQLite gets `SQLITE_FULL`.
+    #[cfg(target_arch = "wasm32")]
+    Full(String),
 }
 
 pub(crate) struct Database {

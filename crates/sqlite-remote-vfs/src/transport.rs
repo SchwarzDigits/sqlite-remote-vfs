@@ -41,7 +41,7 @@ pub(crate) fn dial(config: &ClientConfig) -> Result<Box<dyn Transport>, String> 
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use imp::start;
+pub(crate) use imp::{LocalBridge, Refusal, start, start_local};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
@@ -222,7 +222,9 @@ mod imp {
     //! blocks. After that, sending, receiving and reconnecting all go through the shared buffer.
 
     use std::cell::Cell;
+    use std::fmt;
     use std::rc::Rc;
+    use std::time::Duration;
 
     use js_sys::{Array, Atomics, Int32Array, JsString, Object, Reflect, SharedArrayBuffer, Uint8Array};
     use wasm_bindgen::closure::Closure;
@@ -247,8 +249,11 @@ mod imp {
 
     const STATE_OPEN: i32 = 1;
     const KIND_FRAME: i32 = 1;
+    const KIND_ERROR: i32 = 2;
     const KIND_DONE: i32 = 3;
     const KIND_NOTHING: i32 = 4;
+    const KIND_BUSY: i32 = 5;
+    const KIND_FULL: i32 = 6;
 
     const OP_SEND: i32 = 1;
     const OP_RECEIVE: i32 = 2;
@@ -260,12 +265,22 @@ mod imp {
     const OP_COPY_CLEAR: i32 = 8;
     const OP_COPY_FORGET: i32 = 9;
     const OP_COPY_SELECT: i32 = 10;
+    const OP_LOCAL_OPEN: i32 = 11;
+    const OP_LOCAL_READ: i32 = 12;
+    const OP_LOCAL_COMMIT: i32 = 13;
+    const OP_LOCAL_CLOSE: i32 = 14;
+    const OP_LOCAL_DELETE: i32 = 15;
+
+    const LOCAL_CREATE: u32 = 1;
+    const LOCAL_TAKEOVER: u32 = 2;
+    const PIECE_FIRST: u32 = 1;
+    const PIECE_LAST: u32 = 2;
 
     /// Size of the region for each direction. It must hold the largest frame the server allows.
     const CAPACITY: u32 = 2 << 20;
 
-    /// The connection worker and the memory shared with it. The connection and the local copy both use it, one call
-    /// at a time.
+    /// The connection worker and the memory shared with it. The connection and the local copy, or the local
+    /// databases, use it one call at a time.
     struct Shared {
         worker: Worker,
         control: Int32Array,
@@ -283,6 +298,197 @@ mod imp {
 
     /// Local copy in IndexedDB, kept by the connection worker.
     struct Copy(Rc<Shared>);
+
+    /// Local databases of a VFS without a server, kept in IndexedDB by the connection worker. Each open database holds
+    /// a clone. The worker has at most one database open at a time.
+    #[derive(Clone)]
+    pub(crate) struct LocalBridge(Rc<Shared>);
+
+    /// Head of a local database after opening it.
+    pub(crate) struct Opened {
+        pub page_size: u32,
+        pub page_count: u64,
+        pub epoch: u64,
+    }
+
+    /// Why a request to the local database store did not succeed.
+    #[derive(Debug)]
+    pub(crate) enum Refusal {
+        /// Another instance holds the database, or has taken it over.
+        Busy,
+        /// The database does not exist.
+        Missing,
+        /// The browser's storage quota is exhausted. The stored database is unchanged.
+        Full(String),
+        /// The request failed. The stored database is unchanged.
+        Failed(String),
+        /// The connection worker did not answer in time. The request may still complete.
+        NoAnswer(String),
+    }
+
+    impl fmt::Display for Refusal {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Refusal::Busy => f.write_str("another instance has the database open"),
+                Refusal::Missing => f.write_str("the database does not exist"),
+                Refusal::Full(reason) => write!(f, "storage quota exhausted: {reason}"),
+                Refusal::Failed(reason) | Refusal::NoAnswer(reason) => f.write_str(reason),
+            }
+        }
+    }
+
+    impl LocalBridge {
+        /// Opens database `name`, or creates it with `page_size` if `create` is set. Takes its lock; with `takeover`,
+        /// also if another instance holds it.
+        pub fn open(&self, name: &str, page_size: u32, create: bool, takeover: bool) -> Result<Opened, Refusal> {
+            let mut flags = 0;
+            if create {
+                flags |= LOCAL_CREATE;
+            }
+            if takeover {
+                flags |= LOCAL_TAKEOVER;
+            }
+            let mut request = Vec::with_capacity(8 + name.len());
+            request.extend_from_slice(&flags.to_le_bytes());
+            request.extend_from_slice(&page_size.to_le_bytes());
+            request.extend_from_slice(name.as_bytes());
+            let length = self.request(&request)?;
+            let (kind, length) = self.0.ask(OP_LOCAL_OPEN, length).map_err(Refusal::NoAnswer)?;
+            if kind != KIND_FRAME {
+                return Err(self.refusal(kind));
+            }
+            let bytes = self.0.answer_bytes(length);
+            if bytes.len() != 20 {
+                return Err(Refusal::Failed(format!("head of {} bytes, expected 20", bytes.len())));
+            }
+            Ok(Opened {
+                page_size: u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes")),
+                page_count: u64::from_le_bytes(bytes[4..12].try_into().expect("eight bytes")),
+                epoch: u64::from_le_bytes(bytes[12..20].try_into().expect("eight bytes")),
+            })
+        }
+
+        /// Largest number of blocks of `page_size` bytes that one read returns.
+        pub fn max_read(&self, page_size: usize) -> u64 {
+            ((CAPACITY as usize - 4) / page_size.max(1)).max(1) as u64
+        }
+
+        /// Reads exactly `count` blocks from `first` on, at most [`LocalBridge::max_read`]. Blocks that were never
+        /// written are zeros.
+        pub fn read(&self, first: u64, count: u64) -> Result<Vec<Vec<u8>>, Refusal> {
+            let mut request = Vec::with_capacity(16);
+            request.extend_from_slice(&first.to_le_bytes());
+            request.extend_from_slice(&count.to_le_bytes());
+            let length = self.request(&request)?;
+            let (kind, length) = self.0.ask(OP_LOCAL_READ, length).map_err(Refusal::NoAnswer)?;
+            if kind != KIND_FRAME {
+                return Err(self.refusal(kind));
+            }
+            let all = self.0.answer_bytes(length);
+            let size = all
+                .get(0..4)
+                .map(|header| u32::from_le_bytes(header.try_into().expect("four bytes")) as usize)
+                .unwrap_or(0);
+            let body = all.get(4..).unwrap_or_default();
+            if size == 0 || body.len() != size * count as usize {
+                return Err(Refusal::Failed(format!(
+                    "read of {count} blocks returned {} bytes",
+                    body.len()
+                )));
+            }
+            Ok(body.chunks(size).map(<[u8]>::to_vec).collect())
+        }
+
+        /// Writes the blocks and the new page count in one IndexedDB transaction and returns when it is complete.
+        /// Fails with [`Refusal::Busy`] if the epoch in the stored head is no longer `epoch`.
+        pub fn commit(&self, epoch: u64, page_count: u64, blocks: &[(u64, &[u8])]) -> Result<(), Refusal> {
+            // Data that does not fit the buffer is sent in pieces. The worker collects them and writes them in one
+            // transaction.
+            let mut at = 0;
+            let mut first = true;
+            loop {
+                let mut piece = Vec::with_capacity(CAPACITY as usize / 2);
+                piece.extend_from_slice(&0u32.to_le_bytes()); // flags, set below
+                piece.extend_from_slice(&epoch.to_le_bytes());
+                piece.extend_from_slice(&page_count.to_le_bytes());
+                piece.extend_from_slice(&0u32.to_le_bytes()); // number of blocks, set below
+                let mut count = 0u32;
+                while at < blocks.len() {
+                    let (index, data) = blocks[at];
+                    if piece.len() + 12 + data.len() > CAPACITY as usize && count > 0 {
+                        break;
+                    }
+                    piece.extend_from_slice(&index.to_le_bytes());
+                    piece.extend_from_slice(&(data.len() as u32).to_le_bytes());
+                    piece.extend_from_slice(data);
+                    count += 1;
+                    at += 1;
+                }
+                let last = at >= blocks.len();
+                let mut flags = 0;
+                if first {
+                    flags |= PIECE_FIRST;
+                }
+                if last {
+                    flags |= PIECE_LAST;
+                }
+                piece[0..4].copy_from_slice(&flags.to_le_bytes());
+                piece[20..24].copy_from_slice(&count.to_le_bytes());
+                let length = self.request(&piece)?;
+                let (kind, _) = self.0.ask(OP_LOCAL_COMMIT, length).map_err(Refusal::NoAnswer)?;
+                if kind != KIND_DONE {
+                    return Err(self.refusal(kind));
+                }
+                if last {
+                    return Ok(());
+                }
+                first = false;
+            }
+        }
+
+        /// Closes the open database and releases its lock. Best effort: the lock is also released when the worker
+        /// ends.
+        pub fn close(&self) {
+            let _ = self.0.ask(OP_LOCAL_CLOSE, 0);
+        }
+
+        /// Deletes database `name` under its lock. With `takeover`, also if another instance holds it.
+        pub fn delete(&self, name: &str, takeover: bool) -> Result<(), Refusal> {
+            let flags = if takeover { LOCAL_TAKEOVER } else { 0 };
+            let mut request = Vec::with_capacity(4 + name.len());
+            request.extend_from_slice(&flags.to_le_bytes());
+            request.extend_from_slice(name.as_bytes());
+            let length = self.request(&request)?;
+            let (kind, _) = self.0.ask(OP_LOCAL_DELETE, length).map_err(Refusal::NoAnswer)?;
+            if kind != KIND_DONE {
+                return Err(self.refusal(kind));
+            }
+            Ok(())
+        }
+
+        /// Copies a request into the request region and returns its length.
+        fn request(&self, bytes: &[u8]) -> Result<u32, Refusal> {
+            let length = u32::try_from(bytes.len())
+                .ok()
+                .filter(|length| *length <= CAPACITY)
+                .ok_or_else(|| {
+                    Refusal::Failed(format!("request of {} bytes exceeds the bridge buffer", bytes.len()))
+                })?;
+            self.0.request.subarray(0, length).copy_from(bytes);
+            Ok(length)
+        }
+
+        /// Translates an answer that is not a success.
+        fn refusal(&self, kind: i32) -> Refusal {
+            match kind {
+                KIND_BUSY => Refusal::Busy,
+                KIND_NOTHING => Refusal::Missing,
+                KIND_FULL => Refusal::Full(self.0.answer_text()),
+                KIND_ERROR => Refusal::Failed(self.0.answer_text()),
+                other => Refusal::Failed(format!("unexpected answer {other}")),
+            }
+        }
+    }
 
     impl Transport for Bridge {
         fn send(&mut self, frame: Vec<u8>) -> Result<(), String> {
@@ -526,8 +732,8 @@ mod imp {
     }
 
     impl Drop for Shared {
-        /// Closes the connection and terminates the connection worker. Runs when the last of the two handles
-        /// (`Bridge`, `Copy`) is dropped.
+        /// Closes the connection and terminates the connection worker. Runs when the last handle (`Bridge`, `Copy` or
+        /// `LocalBridge`) is dropped. Ending the worker also releases the locks of local databases.
         fn drop(&mut self) {
             let _ = self.ask(OP_CLOSE, 0);
             self.worker.terminate();
@@ -537,6 +743,29 @@ mod imp {
     /// Starts the connection worker and waits until it is ready and the connection is open. Must be awaited before
     /// SQLite blocks, because the worker can only start while the event loop runs.
     pub(crate) async fn start(config: &ClientConfig) -> Result<(Box<dyn Transport>, Box<dyn LocalStore>), String> {
+        let copy_prefix = format!("sqlite-remote-vfs-cache-{}", crate::subject(&*config.signer));
+        let shared = launch(
+            &[
+                ("url", config.url.as_str().into()),
+                ("copyPrefix", copy_prefix.as_str().into()),
+            ],
+            config.timeout,
+        )
+        .await?;
+        shared.wait_until_open()?;
+        Ok((Box::new(Bridge(Rc::clone(&shared))), Box::new(Copy(shared))))
+    }
+
+    /// Starts the connection worker for local databases named `sqlite-remote-vfs-local/<namespace>/<database>`,
+    /// without a connection.
+    pub(crate) async fn start_local(namespace: &str, timeout: Duration) -> Result<LocalBridge, String> {
+        let prefix = format!("sqlite-remote-vfs-local/{namespace}");
+        let shared = launch(&[("localPrefix", prefix.as_str().into())], timeout).await?;
+        Ok(LocalBridge(shared))
+    }
+
+    /// Starts the connection worker with the shared memory and the given settings, and waits until it is ready.
+    async fn launch(settings: &[(&str, JsValue)], timeout: Duration) -> Result<Rc<Shared>, String> {
         let buffer = SharedArrayBuffer::new(CONTROL_SLOTS * 4 + 2 * CAPACITY);
         let control = Int32Array::new_with_byte_offset_and_length(&buffer, 0, CONTROL_SLOTS);
         let request = Uint8Array::new_with_byte_offset_and_length(&buffer, CONTROL_SLOTS * 4, CAPACITY);
@@ -549,33 +778,26 @@ mod imp {
             });
             worker.set_onmessage(Some(handler.unchecked_ref()));
         });
-        let hand_over = message(&[
+        let mut pairs = vec![
             ("op", "start".into()),
-            ("url", config.url.as_str().into()),
-            (
-                "copyPrefix",
-                format!("sqlite-remote-vfs-cache-{}", crate::subject(&*config.signer))
-                    .as_str()
-                    .into(),
-            ),
             ("buffer", buffer.into()),
             ("controlSlots", CONTROL_SLOTS.into()),
             ("capacity", CAPACITY.into()),
-        ])?;
+        ];
+        pairs.extend(settings.iter().cloned());
+        let hand_over = message(&pairs)?;
         worker.post_message(&hand_over).map_err(describe)?;
         wasm_bindgen_futures::JsFuture::from(ready).await.map_err(describe)?;
         worker.set_onmessage(None);
 
-        let shared = Rc::new(Shared {
+        Ok(Rc::new(Shared {
             worker,
             control,
             request,
             answer,
-            timeout: config.timeout,
+            timeout,
             seen: Cell::new(0),
-        });
-        shared.wait_until_open()?;
-        Ok((Box::new(Bridge(Rc::clone(&shared))), Box::new(Copy(shared))))
+        }))
     }
 
     /// Always fails. In a browser the connection worker must be started with `start` before SQLite blocks.

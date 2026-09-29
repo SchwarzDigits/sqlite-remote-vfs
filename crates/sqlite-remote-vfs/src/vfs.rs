@@ -1,8 +1,8 @@
-//! SQLite VFS built on rsqlite-vfs. The main database file is a [`Database`] on the page server. Journals and
-//! temporary files are kept in memory.
+//! SQLite VFS built on rsqlite-vfs. The main database file is a [`Database`] on the page server or, in a browser, a
+//! local database in IndexedDB. Journals and temporary files are kept in memory.
 //!
 //! SQLite holds a file handle from `xOpen` until `xClose`. The handle of the main database file carries the shared
-//! VFS state and the `Database`. The commit runs in `xFileControl` on `SQLITE_FCNTL_SYNC`.
+//! VFS state and the database. The commit runs in `xFileControl` on `SQLITE_FCNTL_SYNC`.
 
 #![allow(non_snake_case)] // SQLite's callback names
 
@@ -19,7 +19,9 @@ use rsqlite_vfs::{
 };
 
 use crate::client::Client;
-use crate::database::{Database, OpenOptions};
+use crate::database::{Broken, Database, OpenOptions};
+#[cfg(target_arch = "wasm32")]
+use crate::local_database::{LocalDatabase, LocalOptions};
 use crate::platform;
 use crate::{Cache, Config, Load, Memory, Server, Stats};
 
@@ -34,6 +36,9 @@ pub(crate) struct Inner {
 /// Where the databases of a VFS are stored.
 pub(crate) enum Backend {
     Server(ServerBackend),
+    /// Only in this browser, in IndexedDB.
+    #[cfg(target_arch = "wasm32")]
+    Local(crate::transport::LocalBridge),
 }
 
 /// Connection to the page server.
@@ -51,6 +56,8 @@ impl Inner {
     pub fn server(&self) -> &ServerBackend {
         match &self.backend {
             Backend::Server(server) => server,
+            #[cfg(target_arch = "wasm32")]
+            Backend::Local(_) => unreachable!("a VFS for local databases has no server"),
         }
     }
 }
@@ -90,21 +97,74 @@ pub(crate) enum RemoteFile {
 /// The main database file. Holds the shared VFS state, so that every callback can reach the client and the stats.
 pub(crate) struct MainFile {
     inner: Arc<Inner>,
-    db: Database,
+    db: Db,
+}
+
+/// An open main database. `Db::Server` exists only on a VFS with a server.
+enum Db {
+    Server(Database),
+    #[cfg(target_arch = "wasm32")]
+    Local(LocalDatabase),
 }
 
 impl MainFile {
-    /// Commits the transaction to the server. On failure, SQLite gets `SQLITE_IOERR_FSYNC` and rolls back, as on a
-    /// failing disk.
-    fn commit(&mut self) -> VfsResult<()> {
-        let server = self.inner.server();
-        self.db
-            .commit(
-                &mut lock(&server.client),
-                server.settings.reconnect_timeout,
+    /// Commits the transaction. On failure, SQLite gets `SQLITE_IOERR_FSYNC`, or `SQLITE_FULL` if the storage quota
+    /// is exhausted, and rolls back, as on a failing disk.
+    fn commit(&mut self) -> Result<(), Broken> {
+        match &mut self.db {
+            Db::Server(db) => {
+                let server = self.inner.server();
+                db.commit(
+                    &mut lock(&server.client),
+                    server.settings.reconnect_timeout,
+                    &mut lock(&self.inner.stats),
+                )
+            }
+            #[cfg(target_arch = "wasm32")]
+            Db::Local(db) => db.commit(&mut lock(&self.inner.stats)),
+        }
+    }
+
+    fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, Broken> {
+        match &mut self.db {
+            Db::Server(db) => db.read(
+                &mut lock(&self.inner.server().client),
+                buf,
+                offset,
                 &mut lock(&self.inner.stats),
-            )
-            .map_err(|broken| io_error(VfsErrorCode::IoSync, format!("commit failed: {broken:?}")))
+            ),
+            #[cfg(target_arch = "wasm32")]
+            Db::Local(db) => db.read(buf, offset, &mut lock(&self.inner.stats)),
+        }
+    }
+
+    fn write(&mut self, data: &[u8], offset: u64) -> Result<(), Broken> {
+        match &mut self.db {
+            Db::Server(db) => db.write(
+                &mut lock(&self.inner.server().client),
+                data,
+                offset,
+                &mut lock(&self.inner.stats),
+            ),
+            #[cfg(target_arch = "wasm32")]
+            Db::Local(db) => db.write(data, offset, &mut lock(&self.inner.stats)),
+        }
+    }
+
+    fn truncate(&mut self, size: u64) -> Result<(), Broken> {
+        match &mut self.db {
+            Db::Server(db) => db.truncate(size),
+            #[cfg(target_arch = "wasm32")]
+            Db::Local(db) => db.truncate(size),
+        }
+    }
+
+    fn file_size(&self) -> u64 {
+        match &self.db {
+            Db::Server(db) => db.file_size(),
+            #[cfg(target_arch = "wasm32")]
+            Db::Local(db) => db.file_size(),
+        }
     }
 }
 
@@ -113,19 +173,13 @@ impl VfsFile for RemoteFile {
         match self {
             RemoteFile::Main(main) => {
                 let full = main
-                    .db
-                    .read(
-                        &mut lock(&main.inner.server().client),
-                        buf,
-                        offset,
-                        &mut lock(&main.inner.stats),
-                    )
+                    .read(buf, offset)
                     .map_err(|broken| io_error(VfsErrorCode::IoRead, format!("{broken:?}")))?;
                 if full {
                     return Ok(buf.len());
                 }
                 // Short read past the end of the file. `buf` is zero-filled from there. Return the bytes read.
-                let available = main.db.file_size().saturating_sub(offset).min(buf.len() as u64);
+                let available = main.file_size().saturating_sub(offset).min(buf.len() as u64);
                 Ok(available as usize)
             }
             RemoteFile::Temp(temp) => lock(temp).read(buf, offset),
@@ -135,13 +189,7 @@ impl VfsFile for RemoteFile {
     fn write(&mut self, buf: &[u8], offset: u64) -> VfsResult<()> {
         match self {
             RemoteFile::Main(main) => main
-                .db
-                .write(
-                    &mut lock(&main.inner.server().client),
-                    buf,
-                    offset,
-                    &mut lock(&main.inner.stats),
-                )
+                .write(buf, offset)
                 .map_err(|broken| io_error(VfsErrorCode::IoWrite, format!("{broken:?}"))),
             RemoteFile::Temp(temp) => lock(temp).write(buf, offset),
         }
@@ -150,7 +198,6 @@ impl VfsFile for RemoteFile {
     fn truncate(&mut self, size: u64) -> VfsResult<()> {
         match self {
             RemoteFile::Main(main) => main
-                .db
                 .truncate(size)
                 .map_err(|broken| io_error(VfsErrorCode::IoTruncate, format!("{broken:?}"))),
             RemoteFile::Temp(temp) => lock(temp).truncate(size),
@@ -168,7 +215,7 @@ impl VfsFile for RemoteFile {
 
     fn size(&self) -> VfsResult<u64> {
         match self {
-            RemoteFile::Main(main) => Ok(main.db.file_size()),
+            RemoteFile::Main(main) => Ok(main.file_size()),
             RemoteFile::Temp(temp) => lock(temp).size(),
         }
     }
@@ -250,14 +297,18 @@ impl VfsStore for Store {
     fn close_file(data: &AppData, name: Option<&str>, file: RemoteFile, options: FileOptions) -> VfsResult<()> {
         match file {
             RemoteFile::Main(main) => {
-                main.db.close(&mut lock(&main.inner.server().client));
-                // In a browser the cache store exists once per VFS. Hand it back for the next database.
-                #[cfg(target_arch = "wasm32")]
-                {
-                    let mut main = main;
-                    if let Some(store) = main.db.take_local() {
-                        *lock(&data.server().browser_cache) = Some(store);
+                match main.db {
+                    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))]
+                    Db::Server(mut db) => {
+                        db.close(&mut lock(&data.server().client));
+                        // In a browser the cache store exists once per VFS. Hand it back for the next database.
+                        #[cfg(target_arch = "wasm32")]
+                        if let Some(store) = db.take_local() {
+                            *lock(&data.server().browser_cache) = Some(store);
+                        }
                     }
+                    #[cfg(target_arch = "wasm32")]
+                    Db::Local(db) => db.close(),
                 }
                 lock(&data.files).database = None;
             }
@@ -312,6 +363,8 @@ impl SQLiteIoMethods for Io {
         };
         match main.commit() {
             Ok(()) => SQLITE_OK,
+            #[cfg(target_arch = "wasm32")]
+            Err(Broken::Full(_)) => rsqlite_vfs::ffi::SQLITE_FULL,
             Err(_) => SQLITE_IOERR_FSYNC,
         }
     }
@@ -385,6 +438,10 @@ pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), String> 
     }
     match &data.backend {
         Backend::Server(_) => delete_on_server(data, name),
+        #[cfg(target_arch = "wasm32")]
+        Backend::Local(bridge) => bridge
+            .delete(name, data.config.takeover)
+            .map_err(|refusal| format!("deleting {name}: {refusal}")),
     }
 }
 
@@ -417,8 +474,8 @@ fn delete_on_server(data: &AppData, name: &str) -> Result<(), String> {
     result.map_err(|err| format!("{name} was deleted on the server, but its cache was not: {err}"))
 }
 
-/// Opens the database on the page server. Fails if this VFS already has a database open.
-fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Database> {
+/// Opens the database on the page server or locally. Fails if this VFS already has a database open.
+fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Db> {
     let mut files = lock(&data.files);
     if let Some(open) = &files.database {
         let reason = if open == name {
@@ -428,8 +485,30 @@ fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Database
         };
         return Err(io_error(VfsErrorCode::CantOpen, reason));
     }
+    let db = match &data.backend {
+        Backend::Server(server) => Db::Server(open_on_server(data, server, name, create)?),
+        #[cfg(target_arch = "wasm32")]
+        Backend::Local(bridge) => Db::Local(open_locally(data, bridge, name, create)?),
+    };
+    files.database = Some(name.into());
+    Ok(db)
+}
 
-    let server = data.server();
+fn blocks_per_fetch(config: &Config) -> Option<u64> {
+    match config.load {
+        Load::Preload => None,
+        Load::OnDemand { blocks_per_fetch } => Some(blocks_per_fetch.max(1)),
+    }
+}
+
+fn cap(config: &Config) -> Option<u64> {
+    match config.memory {
+        Memory::Unlimited => None,
+        Memory::Blocks(blocks) => Some(blocks),
+    }
+}
+
+fn open_on_server(data: &AppData, server: &ServerBackend, name: &str, create: bool) -> VfsResult<Database> {
     let mut client = lock(&server.client);
     if !client.is_connected() {
         client
@@ -440,23 +519,39 @@ fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Database
         page_size: data.config.page_size,
         create,
         takeover: data.config.takeover,
-        blocks_per_fetch: match data.config.load {
-            Load::Preload => None,
-            Load::OnDemand { blocks_per_fetch } => Some(blocks_per_fetch.max(1)),
-        },
-        cap: match data.config.memory {
-            Memory::Unlimited => None,
-            Memory::Blocks(blocks) => Some(blocks),
-        },
+        blocks_per_fetch: blocks_per_fetch(&data.config),
+        cap: cap(&data.config),
         subject: crate::subject(&*server.settings.signer),
         local: cache_store(data, name),
     };
     match Database::open(&mut client, name, options, &mut lock(&data.stats)) {
-        Ok(db) => {
-            files.database = Some(name.into());
-            Ok(db)
-        }
+        Ok(db) => Ok(db),
         Err(err) if err.is_lease_held() => Err(io_error(VfsErrorCode::Busy, err.to_string())),
         Err(err) => Err(io_error(VfsErrorCode::CantOpen, err.to_string())),
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn open_locally(
+    data: &AppData,
+    bridge: &crate::transport::LocalBridge,
+    name: &str,
+    create: bool,
+) -> VfsResult<LocalDatabase> {
+    use crate::transport::Refusal;
+
+    let options = LocalOptions {
+        page_size: data.config.page_size,
+        create,
+        takeover: data.config.takeover,
+        blocks_per_fetch: blocks_per_fetch(&data.config),
+        cap: cap(&data.config),
+    };
+    LocalDatabase::open(bridge.clone(), name, options, &mut lock(&data.stats)).map_err(|refusal| {
+        let code = match refusal {
+            Refusal::Busy => VfsErrorCode::Busy,
+            _ => VfsErrorCode::CantOpen,
+        };
+        io_error(code, format!("{name}: {refusal}"))
+    })
 }

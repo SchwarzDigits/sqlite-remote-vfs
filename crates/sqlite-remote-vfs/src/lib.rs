@@ -1,4 +1,5 @@
-//! SQLite VFS that stores the database file on a remote page server.
+//! SQLite VFS that stores the database file on a remote page server. In a browser it can also keep databases only in
+//! IndexedDB, without a server (`Store::Local`, browser only).
 //!
 //! The VFS keeps the blocks of the database in memory. At `SQLITE_FCNTL_SYNC` it sends the blocks modified by the
 //! transaction to the server and blocks until the server acknowledges the commit. If the server rejects the commit,
@@ -26,6 +27,8 @@ mod client;
 mod database;
 mod identity;
 mod local;
+#[cfg(target_arch = "wasm32")]
+mod local_database;
 mod pages;
 mod platform;
 mod transport;
@@ -90,10 +93,20 @@ pub enum Store {
     /// On a page server, which is authoritative.
     Server(Server),
     /// Only in this browser, in IndexedDB, without a server. For development, demos, tests and deployments without a
-    /// server. The data is lost when the user clears the site data.
+    /// server. The data is lost when the user clears the site data, and the browser may evict it under storage
+    /// pressure unless the application obtained persistent storage (`navigator.storage.persist()`).
     ///
     /// Each database is an IndexedDB database named `sqlite-remote-vfs-local/<namespace>/<database>`. The namespace
-    /// keeps the databases of different applications or users apart and must not contain `/`.
+    /// keeps the databases of different applications or users apart and must not be empty or contain `/`.
+    ///
+    /// A commit returns when its IndexedDB transaction is complete. It is requested with durability `strict`; whether
+    /// it survives a crash of the operating system depends on the browser. A failed commit leaves the stored database
+    /// unchanged: SQLite gets `SQLITE_FULL` if the storage quota is exhausted, otherwise `SQLITE_IOERR_FSYNC`, and the
+    /// database accepts no more writes until it is opened again.
+    ///
+    /// Only one instance can have a database open, also across tabs: opening takes a Web Lock named after the
+    /// database, and a second instance gets `SQLITE_BUSY`. With [`Config::takeover`] it takes the database over, and
+    /// the first instance can no longer commit. Web Locks need a secure context.
     #[cfg(target_arch = "wasm32")]
     Local { namespace: String },
 }
@@ -186,6 +199,9 @@ impl Config {
 }
 
 /// Counters for measurements, totals since registration.
+///
+/// With `Store::Local`, the commit counters count commits to IndexedDB, `local_reads` and `local_blocks_read` count
+/// reads from it, and the counters for the server and the cache stay zero.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     pub commits: u64,
@@ -254,7 +270,7 @@ impl RemoteVfs {
         Self::finish(name, config, server_backend(settings, client, None))
     }
 
-    /// Browser variant of `register`. With a server, starts the connection worker, connects and logs in.
+    /// Browser variant of `register`. Starts the connection worker. With a server, also connects and logs in.
     ///
     /// Starting a worker needs a running event loop. Call this before opening a database: while SQLite runs, the
     /// SQLite worker is blocked and cannot start a worker.
@@ -273,7 +289,17 @@ impl RemoteVfs {
                     Client::with_transport(transport, client_config).map_err(|err| Error(format!("{url}: {err}")))?;
                 Self::finish(name, config, server_backend(settings, client, Some(cache)))
             }
-            Store::Local { .. } => Err(Error("local databases are not supported yet".into())),
+            Store::Local { namespace } => {
+                if namespace.is_empty() || namespace.contains('/') {
+                    return Err(Error(format!(
+                        "invalid namespace {namespace:?}: it must not be empty or contain '/'"
+                    )));
+                }
+                let bridge = crate::transport::start_local(namespace, config.timeout)
+                    .await
+                    .map_err(Error)?;
+                Self::finish(name, config, Backend::Local(bridge))
+            }
         }
     }
 
@@ -317,6 +343,8 @@ impl RemoteVfs {
     pub fn fetch_trace(&self) -> Vec<(u64, u64)> {
         match &self.inner.backend {
             Backend::Server(server) => lock(&server.client).fetch_trace(),
+            #[cfg(target_arch = "wasm32")]
+            Backend::Local(_) => Vec::new(),
         }
     }
 
@@ -341,6 +369,8 @@ impl RemoteVfs {
     pub fn drop_connection(&self) {
         match &self.inner.backend {
             Backend::Server(server) => lock(&server.client).disconnect(),
+            #[cfg(target_arch = "wasm32")]
+            Backend::Local(_) => {}
         }
     }
 }

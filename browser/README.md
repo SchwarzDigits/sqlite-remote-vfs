@@ -15,9 +15,11 @@ WebAssembly with SQLite3 Multiple Ciphers.
 | `login.rs` | The same key opens the same database again. Another key cannot open it |
 | `copy.rs` | Cache in IndexedDB: reopening without fetches, catching up a stale cache, memory limit with reloads from IndexedDB |
 | `nothing_stored.rs` | Without a cache the browser stores nothing of the database |
+| `local.rs` | Local databases without a server: commits survive a new VFS, a second instance is busy, a takeover fences the first instance, deletion, namespaces, memory limit, commits and preloads larger than the bridge buffer, and the backup of a local database to a server |
 | `measure.rs` | Commit latency, reopening time and read latency under memory limits, printed as Markdown tables |
 
-`spike.rs`, `shared_memory.rs`, `wakeup.rs` and `quota.rs` need no server. All other tests need a page server.
+`spike.rs`, `shared_memory.rs`, `wakeup.rs`, `quota.rs` and `local.rs` need no server, except the backup test in
+`local.rs`. All other tests need a page server.
 
 ## Running
 

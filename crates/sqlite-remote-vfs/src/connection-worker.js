@@ -1,4 +1,5 @@
-// Connection worker: holds the WebSocket and the IndexedDB local copy, and serves requests from the SQLite worker.
+// Connection worker: holds the WebSocket and the IndexedDB local copy, or the local databases of a VFS without a server,
+// and serves requests from the SQLite worker.
 //
 // The SQLite worker runs inside synchronous SQLite calls and cannot await anything. It writes a request to shared
 // memory, sets the REQUEST slot and blocks in Atomics.wait until this worker has written the answer. Together, the
@@ -28,7 +29,9 @@ const STATE_FAILED = 2;
 const KIND_FRAME = 1;
 const KIND_ERROR = 2;
 const KIND_DONE = 3;
-const KIND_NOTHING = 4; // the local copy does not have the requested data
+const KIND_NOTHING = 4; // the local copy does not have the requested data, or the local database does not exist
+const KIND_BUSY = 5; // another instance holds the local database or has taken it over
+const KIND_FULL = 6; // the browser's storage quota is exhausted
 
 const OP_SEND = 1;
 const OP_RECEIVE = 2;
@@ -42,6 +45,12 @@ const OP_COPY_WRITE = 7;
 const OP_COPY_CLEAR = 8;
 const OP_COPY_FORGET = 9;
 const OP_COPY_SELECT = 10;
+// Local database operations, for a VFS without a server.
+const OP_LOCAL_OPEN = 11;
+const OP_LOCAL_READ = 12;
+const OP_LOCAL_COMMIT = 13;
+const OP_LOCAL_CLOSE = 14;
+const OP_LOCAL_DELETE = 15;
 
 const encoder = new TextEncoder();
 
@@ -62,6 +71,16 @@ let pending = [];
 let chain = Promise.resolve();
 // Copies for which clearing after a failed write also failed. They are never read again.
 const givenUp = new Set();
+
+// Local databases: one IndexedDB database per database, named localPrefix + "/" + name, with a "blocks" store and a
+// "head" store. The head holds page size, page count and epoch. A Web Lock of the same name keeps other instances out.
+// Opening increments the epoch, and every commit checks it in the transaction that writes the blocks, so an instance
+// whose lock was taken over cannot commit, even before it learns that it lost the lock.
+let localPrefix = null;
+// The open local database: { name, database, pageSize, epoch, lock, closed }.
+let local = null;
+// Blocks of a local commit that arrives in several pieces.
+let localPending = [];
 
 // Frames received before the SQLite worker asked for them, and the first connection error, which is returned for
 // every later request.
@@ -298,7 +317,105 @@ function work() {
       });
       break;
     }
+
+    // Request: flags (u32: 1 create, 2 take over), page size (u32), name. Answer: page size (u32), page count (u64),
+    // epoch (u64).
+    case OP_LOCAL_OPEN: {
+      const chunk = request.slice(0, Atomics.load(control, REQUEST_LENGTH));
+      const view = new DataView(chunk.buffer);
+      const flags = view.getUint32(0, true);
+      const pageSize = view.getUint32(4, true);
+      const name = new TextDecoder().decode(chunk.subarray(8));
+      answerLocal(async () => {
+        const opened = await localOpen(name, pageSize, (flags & 1) !== 0, (flags & 2) !== 0);
+        if (opened === KIND_BUSY || opened === KIND_NOTHING) {
+          put(opened, null);
+          return;
+        }
+        const bytes = new Uint8Array(20);
+        const out = new DataView(bytes.buffer);
+        out.setUint32(0, opened.pageSize, true);
+        out.setBigUint64(4, BigInt(opened.pageCount), true);
+        out.setBigUint64(12, BigInt(opened.epoch), true);
+        put(KIND_FRAME, bytes);
+      });
+      break;
+    }
+
+    // Request: first block (u64), count (u64). Answer: block size (u32), then exactly `count` blocks. Blocks that
+    // were never written are zeros.
+    case OP_LOCAL_READ: {
+      const view = new DataView(request.buffer, request.byteOffset, 16);
+      const first = Number(view.getBigUint64(0, true));
+      const count = Number(view.getBigUint64(8, true));
+      answerLocal(async () => {
+        const bytes = await localRead(first, count);
+        put(bytes === KIND_BUSY ? KIND_BUSY : KIND_FRAME, bytes === KIND_BUSY ? null : bytes);
+      });
+      break;
+    }
+
+    // A commit arrives in one or more pieces. Each piece: flags (u32: 1 first piece, 2 last piece), epoch (u64),
+    // page count (u64), number of blocks (u32), then per block its index (u64), length (u32) and data. The pieces
+    // before the last are answered at once. The last is answered when the transaction is complete.
+    case OP_LOCAL_COMMIT: {
+      const chunk = request.slice(0, Atomics.load(control, REQUEST_LENGTH));
+      const view = new DataView(chunk.buffer);
+      const flags = view.getUint32(0, true);
+      const epoch = Number(view.getBigUint64(4, true));
+      const pageCount = Number(view.getBigUint64(12, true));
+      const count = view.getUint32(20, true);
+      if ((flags & 1) !== 0) {
+        localPending = [];
+      }
+      let at = 24;
+      for (let i = 0; i < count; i++) {
+        const index = Number(view.getBigUint64(at, true));
+        at += 8;
+        const size = view.getUint32(at, true);
+        at += 4;
+        localPending.push([index, chunk.slice(at, at + size)]);
+        at += size;
+      }
+      if ((flags & 2) === 0) {
+        put(KIND_DONE, null);
+        break;
+      }
+      const blocks = localPending;
+      localPending = [];
+      answerLocal(async () => put(await localCommit(epoch, pageCount, blocks), null));
+      break;
+    }
+
+    case OP_LOCAL_CLOSE:
+      answerLocal(async () => {
+        localClose();
+        put(KIND_DONE, null);
+      });
+      break;
+
+    // Request: flags (u32: 2 take over), name.
+    case OP_LOCAL_DELETE: {
+      const chunk = request.slice(0, Atomics.load(control, REQUEST_LENGTH));
+      const flags = new DataView(chunk.buffer).getUint32(0, true);
+      const name = new TextDecoder().decode(chunk.subarray(4));
+      answerLocal(async () => put(await localDelete(name, (flags & 2) !== 0), null));
+      break;
+    }
   }
+}
+
+// Runs a local database job in the queue and answers with its error if it fails. A full storage quota is reported as
+// such, so that SQLite returns SQLITE_FULL.
+function answerLocal(job) {
+  queue(async () => {
+    try {
+      await job();
+    } catch (error) {
+      const kind = error !== null && error.name === "QuotaExceededError" ? KIND_FULL : KIND_ERROR;
+      put(kind, encoder.encode("local database: " + error));
+    }
+  });
 }
 
 // Runs local copy jobs one after another, in request order.
@@ -334,7 +451,19 @@ function openCopy() {
         database.createObjectStore("head");
       }
     };
-    request.onsuccess = () => resolve(request.result);
+    request.onsuccess = () => {
+      const database = request.result;
+      // Another instance deletes this copy. Close, so that the deletion is not blocked. The next operation opens the
+      // copy again.
+      const opened = copy;
+      database.onversionchange = () => {
+        database.close();
+        if (copy === opened) {
+          copy = null;
+        }
+      };
+      resolve(database);
+    };
     request.onerror = () => reject(request.error);
   });
   return copy;
@@ -476,6 +605,231 @@ async function copyClear() {
   });
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Local databases (IndexedDB, Web Locks)
+// ---------------------------------------------------------------------------------------------------------------
+
+// Takes the Web Lock `name`. Resolves with the held lock, or with null if another instance holds it and `steal` is
+// false. The lock is held until `release` is called or this worker ends. If another instance steals it, `lost` is set.
+function acquire(name, steal) {
+  if (typeof navigator.locks === "undefined") {
+    return Promise.reject(new Error("Web Locks are not available; the page must be a secure context"));
+  }
+  return new Promise((resolve, reject) => {
+    const held = { release: null, lost: false };
+    let granted = false;
+    navigator.locks
+      .request(name, steal ? { steal: true } : { ifAvailable: true }, (lock) => {
+        if (lock === null) {
+          resolve(null);
+          return undefined;
+        }
+        granted = true;
+        return new Promise((release) => {
+          held.release = release;
+          resolve(held);
+        });
+      })
+      .catch((error) => {
+        // The request is rejected with an AbortError when another instance steals the lock.
+        held.lost = true;
+        if (!granted) {
+          reject(error);
+        }
+      });
+  });
+}
+
+function openLocal(name) {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(name, 1);
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore("blocks");
+      request.result.createObjectStore("head");
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// Deletes an IndexedDB database. While another connection is open, the deletion waits; that connection closes on its
+// versionchange event.
+function deleteIndexedDb(name) {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.deleteDatabase(name);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+}
+
+// Opens local database `name`: takes its lock, then increments the epoch in the head, in one transaction. Returns the
+// head, KIND_BUSY if another instance holds the lock, or KIND_NOTHING if the database does not exist and `create` is
+// false.
+async function localOpen(name, pageSize, create, takeover) {
+  if (local !== null) {
+    throw new Error(local.name + " is already open");
+  }
+  const fullName = localPrefix + "/" + name;
+  const lock = await acquire(fullName, takeover);
+  if (lock === null) {
+    return KIND_BUSY;
+  }
+  let database = null;
+  try {
+    database = await openLocal(fullName);
+    const opened = database;
+    opened.onversionchange = () => {
+      // Another instance deletes this database. It must have taken the lock first, so this instance can no longer
+      // commit anyway.
+      opened.close();
+      if (local !== null && local.database === opened) {
+        local.closed = true;
+      }
+    };
+    opened.onclose = () => {
+      // Closed by the browser, for example because the user deleted the site data.
+      if (local !== null && local.database === opened) {
+        local.closed = true;
+      }
+    };
+    let head = null;
+    const transaction = database.transaction("head", "readwrite", { durability: "strict" });
+    const store = transaction.objectStore("head");
+    const get = store.get("head");
+    get.onsuccess = () => {
+      const found = get.result;
+      if (found === undefined && !create) {
+        return;
+      }
+      const base = found ?? { pageSize, pageCount: 0, epoch: 0 };
+      head = { pageSize: base.pageSize, pageCount: base.pageCount, epoch: base.epoch + 1 };
+      store.put(head, "head");
+    };
+    await finished(transaction);
+    if (head === null) {
+      // Do not leave the empty database behind that opening created.
+      database.close();
+      database = null;
+      await deleteIndexedDb(fullName);
+      lock.release();
+      return KIND_NOTHING;
+    }
+    local = { name, database, pageSize: head.pageSize, epoch: head.epoch, lock, closed: false };
+    return head;
+  } catch (error) {
+    if (database !== null) {
+      database.close();
+    }
+    lock.release();
+    throw error;
+  }
+}
+
+// The open local database, or null if this instance lost it: its lock was taken over or its connection closed.
+function localDatabase() {
+  if (local === null) {
+    throw new Error("no local database is open");
+  }
+  return local.lock.lost || local.closed ? null : local.database;
+}
+
+// Returns the answer to OP_LOCAL_READ, or KIND_BUSY if another instance has taken over.
+async function localRead(first, count) {
+  const database = localDatabase();
+  if (database === null) {
+    return KIND_BUSY;
+  }
+  const size = local.pageSize;
+  const transaction = database.transaction("blocks", "readonly");
+  const store = transaction.objectStore("blocks");
+  // Both requests are issued before either is awaited, as in copyRead.
+  const range = IDBKeyRange.bound(first, first + count - 1);
+  const wanted = store.getAll(range);
+  const names = store.getAllKeys(range);
+  const blocks = await got(wanted);
+  const keys = await got(names);
+  // Blocks that were never written stay zero.
+  const bytes = new Uint8Array(4 + size * count);
+  new DataView(bytes.buffer).setUint32(0, size, true);
+  for (let i = 0; i < keys.length; i++) {
+    const block = new Uint8Array(blocks[i]);
+    if (block.length !== size) {
+      throw new Error("block " + keys[i] + " has " + block.length + " bytes, expected " + size);
+    }
+    bytes.set(block, 4 + (keys[i] - first) * size);
+  }
+  return bytes;
+}
+
+// Writes the blocks and the new page count in one transaction, if the epoch in the head is still this instance's.
+// Returns KIND_DONE, or KIND_BUSY if another instance has taken over. Failures reject, and the transaction leaves the
+// stored database unchanged.
+function localCommit(epoch, pageCount, blocks) {
+  const database = localDatabase();
+  if (database === null) {
+    return Promise.resolve(KIND_BUSY);
+  }
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(["blocks", "head"], "readwrite", { durability: "strict" });
+    const heads = transaction.objectStore("head");
+    let fenced = false;
+    const get = heads.get("head");
+    get.onsuccess = () => {
+      const head = get.result;
+      if (head === undefined || head.epoch !== epoch) {
+        fenced = true;
+        transaction.abort();
+        return;
+      }
+      const store = transaction.objectStore("blocks");
+      for (const [index, data] of blocks) {
+        store.put(data, index);
+      }
+      // Delete blocks beyond the new end of the database.
+      store.delete(IDBKeyRange.lowerBound(pageCount));
+      heads.put({ pageSize: head.pageSize, pageCount, epoch }, "head");
+    };
+    transaction.oncomplete = () => resolve(KIND_DONE);
+    transaction.onabort = () => {
+      if (fenced) {
+        resolve(KIND_BUSY);
+      } else {
+        reject(transaction.error ?? new Error("the transaction was aborted"));
+      }
+    };
+  });
+}
+
+function localClose() {
+  if (local === null) {
+    return;
+  }
+  local.database.close();
+  if (local.lock.release !== null) {
+    local.lock.release();
+  }
+  local = null;
+}
+
+// Deletes local database `name` under its lock. Returns KIND_DONE, or KIND_BUSY if another instance holds it and
+// `takeover` is false.
+async function localDelete(name, takeover) {
+  if (local !== null && local.name === name) {
+    throw new Error(name + " is open");
+  }
+  const fullName = localPrefix + "/" + name;
+  const lock = await acquire(fullName, takeover);
+  if (lock === null) {
+    return KIND_BUSY;
+  }
+  try {
+    await deleteIndexedDb(fullName);
+  } finally {
+    lock.release();
+  }
+  return KIND_DONE;
+}
+
 function take() {
   if (Atomics.exchange(control, REQUEST, 0) === 1) {
     work();
@@ -517,9 +871,13 @@ self.onmessage = (event) => {
   control = new Int32Array(message.buffer, 0, message.controlSlots);
   request = new Uint8Array(message.buffer, dataStart, message.capacity);
   answer = new Uint8Array(message.buffer, dataStart + message.capacity, message.capacity);
-  url = message.url;
-  copyPrefix = message.copyPrefix;
-  connect();
+  url = message.url ?? null;
+  copyPrefix = message.copyPrefix ?? null;
+  localPrefix = message.localPrefix ?? null;
+  // Without a URL, the VFS keeps its databases only in this browser and there is no connection.
+  if (url !== null) {
+    connect();
+  }
   if (typeof Atomics.waitAsync === "function") {
     serve();
   } else {

@@ -6,7 +6,8 @@ A SQLite VFS that stores the database file on a remote server instead of the loc
 the client process. A commit returns only after the server has stored it. With encryption above the VFS, such as
 SQLite3 Multiple Ciphers or SQLCipher, the server stores only encrypted pages.
 
-Runs natively and in the browser (`wasm32-unknown-unknown`).
+Runs natively and in the browser (`wasm32-unknown-unknown`). In the browser it can also keep databases only in
+IndexedDB, without a server.
 
 Status: works and is tested, not yet in production use. Versions are 0.x: the protocol and the API can still change.
 
@@ -37,8 +38,11 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   used. Blocks modified since the last commit are never evicted.
 - **Loading.** `Load::Preload` (default) reads the whole database when it is opened. `Load::OnDemand` fetches blocks
   when SQLite first reads them.
+- **Local databases in the browser.** `Config::local` keeps the databases only in IndexedDB, with the same API and
+  without a server or signer. A commit returns when its IndexedDB transaction is complete. One instance per database
+  at a time, also across tabs; see [Local databases](#local-databases).
 - **TLS.** `wss://` natively via rustls, trusting the operating system's certificate store and the CAs in
-  `Config::extra_roots`. In the browser, the browser handles TLS. `ws://` is supported for local servers and servers
+  `Server::extra_roots`. In the browser, the browser handles TLS. `ws://` is supported for local servers and servers
   behind a TLS-terminating proxy.
 
 ## Example
@@ -93,6 +97,41 @@ fetches, the cache and evictions.
 - `Cache::Browser` keeps the cache in IndexedDB.
 
 `browser/` builds SQLite with SQLite3 Multiple Ciphers for the browser and contains the browser tests.
+
+### Local databases
+
+In the browser, a VFS can keep its databases only in IndexedDB, for development, demos, tests and deployments without
+a server. Opening, encryption and SQL are the same as with a server:
+
+```rust
+let vfs = RemoteVfs::register_async("local", Config::local("my-app")).await?;
+let conn = Connection::open_with_flags_and_vfs("app.db", flags, vfs.encrypted_name().as_str())?;
+```
+
+- Each database is an IndexedDB database named `sqlite-remote-vfs-local/<namespace>/<database>`. The namespace keeps
+  applications or users apart and must not be empty or contain `/`.
+- **Durability.** A commit returns when its IndexedDB transaction is complete. It is requested with durability
+  `strict`, which asks the browser to write it to disk before completing; browsers without that option use their
+  default. A completed commit survives a crash of the tab or the browser. Whether it survives a crash of the operating
+  system or a power loss depends on that write to disk.
+- **Failures.** A failed commit leaves the stored database unchanged. SQLite gets `SQLITE_FULL` if the storage quota
+  is exhausted, otherwise `SQLITE_IOERR_FSYNC`, and rolls back. The database then accepts no more writes until it is
+  opened again.
+- **One instance per database.** Opening takes a Web Lock named after the database, which also covers other tabs
+  and workers of the origin. A second instance gets `SQLITE_BUSY`. With `Config::takeover` it takes the database over;
+  the first instance then can no longer commit. Opening also increments an epoch in the stored database, and every
+  commit checks it in its transaction, so this holds even before the first instance learns that it lost the lock.
+  Locks need a secure context (HTTPS or localhost).
+- `RemoteVfs::delete_database` takes the lock too, so it fails while another instance has the database open, unless
+  `Config::takeover` is set.
+- The data is lost when the user clears the site data, and the browser may evict it under storage pressure. The
+  application can ask for persistent storage with `navigator.storage.persist()`.
+- `Load` and `Memory` work as with a server. `vfs.stats()` counts commits to IndexedDB as commits and reads from it
+  as `local_reads`; the server counters stay zero.
+
+To move a local database to a server, open it and an empty database on a server VFS, both with the same key, and copy
+it with SQLite's online backup API (`rusqlite::backup::Backup`), in steps. The source can be used between the steps.
+The copy reaches the server as one commit, so it must fit the server's commit limit (256 MiB by default).
 
 ## Other languages
 
