@@ -19,7 +19,7 @@ use rcgen::{
 use rusqlite::{Connection, OpenFlags};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
-use sqlite_remote_vfs::{Algorithm, Config, RemoteVfs, Signer};
+use sqlite_remote_vfs::{Algorithm, Config, RemoteVfs, Server, Signer, Store};
 
 const KEY: [u8; 32] = [0x11; 32];
 
@@ -168,6 +168,13 @@ fn open(vfs: &RemoteVfs, create: bool) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Configuration that trusts the test CA in addition to the system's CAs.
+fn trusting(url: &str, signer: Arc<dyn Signer>, authority: &Authority) -> Config {
+    let mut server = Server::new(url, signer);
+    server.extra_roots = vec![authority.der.to_vec()];
+    Config::new(Store::Server(server))
+}
+
 #[test]
 fn database_round_trips_over_wss() {
     let Some(url) = server_url() else { return };
@@ -177,9 +184,7 @@ fn database_round_trips_over_wss() {
     let wss = format!("wss://localhost:{port}/v1/ws");
     let me = key();
 
-    let mut config = Config::new(&wss, me.clone());
-    config.extra_roots = vec![authority.der.to_vec()];
-    let vfs = register(config).expect("connect over wss://");
+    let vfs = register(trusting(&wss, me.clone(), &authority)).expect("connect over wss://");
     let conn = open(&vfs, true).expect("open database");
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
         .unwrap();
@@ -191,9 +196,7 @@ fn database_round_trips_over_wss() {
     drop(vfs);
 
     // A new VFS instance reads the data back from the server over TLS.
-    let mut config = Config::new(&wss, me);
-    config.extra_roots = vec![authority.der.to_vec()];
-    let again = register(config).expect("reconnect over wss://");
+    let again = register(trusting(&wss, me, &authority)).expect("reconnect over wss://");
     let conn = open(&again, false).expect("reopen database");
     let rows: i64 = conn.query_row("SELECT count(*) FROM t", [], |row| row.get(0)).unwrap();
     assert_eq!(rows, 50);
@@ -210,7 +213,7 @@ fn rejects_certificate_from_unknown_ca() {
     let (certificate, private) = authority.certify("localhost");
     let port = terminate(&backend(&url), certificate, private);
 
-    let refused = register(Config::new(format!("wss://localhost:{port}/v1/ws"), key()));
+    let refused = register(Config::server(format!("wss://localhost:{port}/v1/ws"), key()));
     let reason = refused
         .err()
         .expect("certificate from an unknown CA must be rejected")
@@ -230,9 +233,7 @@ fn rejects_certificate_for_other_host() {
     let (certificate, private) = authority.certify("someone-else.test");
     let port = terminate(&backend(&url), certificate, private);
 
-    let mut config = Config::new(format!("wss://localhost:{port}/v1/ws"), key());
-    config.extra_roots = vec![authority.der.to_vec()];
-    let refused = register(config);
+    let refused = register(trusting(&format!("wss://localhost:{port}/v1/ws"), key(), &authority));
     let reason = refused
         .err()
         .expect("certificate for another host must be rejected")

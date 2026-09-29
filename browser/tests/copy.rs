@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OpenFlags};
-use sqlite_remote_vfs::{Config, Load, Local, Memory, RemoteVfs, Signer};
+use sqlite_remote_vfs::{Cache, Load, Memory, RemoteVfs, Signer};
 use sqlite_wasm_rs as _;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -28,11 +28,10 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{hex}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-async fn register(url: &str, subject: &Arc<dyn Signer>, local: Local) -> RemoteVfs {
-    let mut config = Config::new(url, subject.clone());
+async fn register(url: &str, subject: &Arc<dyn Signer>, cache: Cache) -> RemoteVfs {
+    let mut config = common::config(url, subject, cache);
     config.takeover = true;
     config.load = Load::Preload;
-    config.local = local;
     RemoteVfs::register_async(&unique("vfs"), config)
         .await
         .expect("register the VFS")
@@ -62,7 +61,7 @@ async fn current_local_copy_avoids_fetches() {
     let Some(url) = SERVER else { return };
     let subject = common::key();
 
-    let vfs = register(url, &subject, Local::Browser).await;
+    let vfs = register(url, &subject, Cache::Browser).await;
     let conn = open(&vfs);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
         .expect("create");
@@ -76,7 +75,7 @@ async fn current_local_copy_avoids_fetches() {
     drop(vfs);
 
     // Same database again. The local copy holds every block.
-    let again = register(url, &subject, Local::Browser).await;
+    let again = register(url, &subject, Cache::Browser).await;
     let conn = open(&again);
     assert_eq!(count(&conn), 30, "all rows must be read back");
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0)).unwrap();
@@ -92,7 +91,7 @@ async fn current_local_copy_avoids_fetches() {
 async fn local_copy_of_other_subject_is_ignored() {
     let Some(url) = SERVER else { return };
 
-    let vfs = register(url, &common::key(), Local::Browser).await;
+    let vfs = register(url, &common::key(), Cache::Browser).await;
     let conn = open(&vfs);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .expect("create");
@@ -102,7 +101,7 @@ async fn local_copy_of_other_subject_is_ignored() {
     drop(vfs);
 
     // Another subject has its own local copy. None of the first subject's rows may appear.
-    let elsewhere = register(url, &common::key(), Local::Browser).await;
+    let elsewhere = register(url, &common::key(), Cache::Browser).await;
     let conn = open(&elsewhere);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .expect("create");
@@ -114,7 +113,7 @@ async fn reopen_without_local_copy_fetches_from_server() {
     let Some(url) = SERVER else { return };
     let subject = common::key();
 
-    let vfs = register(url, &subject, Local::None).await;
+    let vfs = register(url, &subject, Cache::None).await;
     let conn = open(&vfs);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)")
         .expect("create");
@@ -122,7 +121,7 @@ async fn reopen_without_local_copy_fetches_from_server() {
     drop(conn);
     drop(vfs);
 
-    let again = register(url, &subject, Local::None).await;
+    let again = register(url, &subject, Cache::None).await;
     let conn = open(&again);
     assert_eq!(count(&conn), 2);
     assert!(again.stats().fetches > 0, "blocks must be fetched from the server");
@@ -132,10 +131,9 @@ async fn reopen_without_local_copy_fetches_from_server() {
 /// Registers a VFS with a local copy, on-demand loading and a memory limit of `blocks` blocks. Nothing is preloaded.
 /// Evicted blocks are reloaded from IndexedDB.
 async fn register_capped(url: &str, subject: &Arc<dyn Signer>, blocks: u64) -> RemoteVfs {
-    let mut config = Config::new(url, subject.clone());
+    let mut config = common::config(url, subject, Cache::Browser);
     config.takeover = true;
     config.load = Load::OnDemand { blocks_per_fetch: 8 };
-    config.local = Local::Browser;
     config.memory = Memory::Blocks(blocks);
     RemoteVfs::register_async(&unique("vfs"), config)
         .await
@@ -242,7 +240,7 @@ async fn stale_local_copy_is_caught_up() {
     let Some(url) = SERVER else { return };
     let subject = common::key();
 
-    let vfs = register(url, &subject, Local::Browser).await;
+    let vfs = register(url, &subject, Cache::Browser).await;
     let conn = open(&vfs);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB)")
         .expect("create");
@@ -257,7 +255,7 @@ async fn stale_local_copy_is_caught_up() {
 
     // A second VFS commits one row. It uses no local copy, so the copy in IndexedDB stays at the older version.
     let elsewhere = {
-        let mut config = Config::new(url, subject.clone());
+        let mut config = common::config(url, &subject, Cache::None);
         config.takeover = true;
         RemoteVfs::register_async(&unique("vfs"), config)
             .await
@@ -269,7 +267,7 @@ async fn stale_local_copy_is_caught_up() {
     drop(conn);
     drop(elsewhere);
 
-    let again = register(url, &subject, Local::Browser).await;
+    let again = register(url, &subject, Cache::Browser).await;
     let conn = open(&again);
     assert_eq!(count(&conn), 401, "row from the second VFS must be visible");
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0)).unwrap();
@@ -290,7 +288,7 @@ async fn stale_local_copy_is_caught_up() {
 async fn local_copy_is_used_again_after_close_in_same_vfs() {
     let Some(url) = SERVER else { return };
     let subject = common::key();
-    let vfs = register(url, &subject, Local::Browser).await;
+    let vfs = register(url, &subject, Cache::Browser).await;
     let conn = open(&vfs);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
         .expect("create");
@@ -319,8 +317,8 @@ async fn local_copy_is_used_again_after_close_in_same_vfs() {
 async fn delete_removes_database_and_indexeddb_copy() {
     let Some(url) = SERVER else { return };
     let subject = common::key();
-    let copy_name = format!("sqlite-remote-vfs-copy-{}/db", sqlite_remote_vfs::subject(&*subject));
-    let vfs = register(url, &subject, Local::Browser).await;
+    let copy_name = format!("sqlite-remote-vfs-cache-{}/db", sqlite_remote_vfs::subject(&*subject));
+    let vfs = register(url, &subject, Cache::Browser).await;
     let conn = open(&vfs);
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
         .expect("create");
@@ -355,8 +353,8 @@ async fn two_databases_of_one_key_keep_their_own_copies() {
     let subject = common::key();
     let databases = [("first", 10), ("second", 20)];
 
-    let first = register(url, &subject, Local::Browser).await;
-    let second = register(url, &subject, Local::Browser).await;
+    let first = register(url, &subject, Cache::Browser).await;
+    let second = register(url, &subject, Cache::Browser).await;
     for ((name, rows), vfs) in databases.iter().zip([&first, &second]) {
         let conn = open_named(vfs, name);
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
@@ -374,7 +372,7 @@ async fn two_databases_of_one_key_keep_their_own_copies() {
     drop((first, second));
 
     for (name, rows) in databases {
-        let vfs = register(url, &subject, Local::Browser).await;
+        let vfs = register(url, &subject, Cache::Browser).await;
         let conn = open_named(&vfs, name);
         assert_eq!(count(&conn), rows, "{name}: all rows must be read back");
         let stats = vfs.stats();

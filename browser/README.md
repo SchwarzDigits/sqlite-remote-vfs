@@ -13,8 +13,8 @@ WebAssembly with SQLite3 Multiple Ciphers.
 | `quota.rs` | The browser's storage quota for the origin is larger than 512 MiB |
 | `remote.rs` | A database written through the remote VFS is read back from the server, and each autocommit statement is one commit |
 | `login.rs` | The same key opens the same database again. Another key cannot open it |
-| `copy.rs` | Local copy in IndexedDB: reopening without fetches, catching up a stale copy, memory limit with reloads from IndexedDB |
-| `nothing_stored.rs` | Without a local copy the browser stores nothing of the database |
+| `copy.rs` | Cache in IndexedDB: reopening without fetches, catching up a stale cache, memory limit with reloads from IndexedDB |
+| `nothing_stored.rs` | Without a cache the browser stores nothing of the database |
 | `measure.rs` | Commit latency, reopening time and read latency under memory limits, printed as Markdown tables |
 
 `spike.rs`, `shared_memory.rs`, `wakeup.rs` and `quota.rs` need no server. All other tests need a page server.

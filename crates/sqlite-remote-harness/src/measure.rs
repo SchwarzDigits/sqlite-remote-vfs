@@ -8,7 +8,7 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use sqlite_remote_vfs::{Config, Load, RemoteVfs, Stats};
+use sqlite_remote_vfs::{Cache, Config, Load, RemoteVfs, Server, Stats, Store};
 
 use crate::proxy::{Policy, Proxy};
 use crate::workload;
@@ -104,12 +104,13 @@ fn local_copy(settings: &Settings, report: &mut String) -> Result<(), String> {
         let _ = std::fs::remove_file(&path);
         let signer = crate::key::signer(&subject)?;
         let make = |load: Load| {
-            let mut config = Config::new(&settings.url, signer.clone());
+            let mut server = Server::new(&settings.url, signer.clone());
+            if with_copy {
+                server.cache = Cache::File(path.clone());
+            }
+            let mut config = Config::new(Store::Server(server));
             config.load = load;
             config.takeover = true;
-            if with_copy {
-                config.local = sqlite_remote_vfs::Local::File(path.clone());
-            }
             config
         };
 
@@ -469,7 +470,7 @@ impl Settings {
 }
 
 fn register(url: &str, key: &str, page_size: u32, load: Load) -> Result<RemoteVfs, String> {
-    let mut config = Config::new(url, crate::key::signer(key)?);
+    let mut config = Config::server(url, crate::key::signer(key)?);
     config.page_size = page_size;
     config.load = load;
     config.takeover = true;

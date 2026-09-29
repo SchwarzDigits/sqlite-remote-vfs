@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use js_sys::{Array, Function, Promise, Reflect};
-use sqlite_remote_vfs::{Algorithm, Signer};
+use sqlite_remote_vfs::{Algorithm, Cache, Config, Server, Signer, Store};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
@@ -16,6 +16,14 @@ pub fn key() -> Arc<dyn Signer> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).unwrap();
     Arc::new(TestSigner(ed25519_dalek::SigningKey::from_bytes(&seed)))
+}
+
+/// Configuration for the page server at `url` with the given cache.
+#[allow(dead_code, reason = "not every test file uses a cache")]
+pub fn config(url: &str, signer: &Arc<dyn Signer>, cache: Cache) -> Config {
+    let mut server = Server::new(url, Arc::clone(signer));
+    server.cache = cache;
+    Config::new(Store::Server(server))
 }
 
 struct TestSigner(ed25519_dalek::SigningKey);

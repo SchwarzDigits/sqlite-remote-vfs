@@ -35,7 +35,7 @@ fn config_debug_output_hides_secret() {
         secret: [0xab; 32],
         public: [0x7e; 32],
     };
-    let config = Config::new("ws://server.test", Arc::new(keeper));
+    let config = Config::server("ws://server.test", Arc::new(keeper));
     let printed = format!("{config:?}");
 
     // The repeated secret byte 0xab in decimal, lowercase hex, uppercase hex and base64.

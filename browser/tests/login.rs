@@ -30,7 +30,7 @@ fn unique(prefix: &str) -> String {
 }
 
 async fn register(url: &str, key: &Arc<dyn Signer>) -> Result<RemoteVfs, sqlite_remote_vfs::Error> {
-    let mut config = Config::new(url, key.clone());
+    let mut config = Config::server(url, key.clone());
     config.takeover = true;
     RemoteVfs::register_async(&unique("vfs"), config).await
 }

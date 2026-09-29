@@ -37,7 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use sqlite_remote_vfs::{Config, RemoteVfs, Stats};
+use sqlite_remote_vfs::{Cache, Config, RemoteVfs, Server, Stats, Store};
 
 use crate::measure::host_of;
 use crate::proxy::{Policy, Proxy};
@@ -140,14 +140,15 @@ fn register(url: &str, key: &str, timeout: Duration) -> Result<RemoteVfs, String
 }
 
 fn register_with(url: &str, key: &str, timeout: Duration, local: Option<&str>) -> Result<RemoteVfs, String> {
-    let mut config = Config::new(url, key::signer(key)?);
+    let mut server = Server::new(url, key::signer(key)?);
     if let Some(path) = local {
-        config.local = sqlite_remote_vfs::Local::File(path.into());
+        server.cache = Cache::File(path.into());
     }
+    server.reconnect_timeout = Duration::from_secs(20);
+    let mut config = Config::new(Store::Server(server));
     // A killed or failed previous process may still hold the lease.
     config.takeover = true;
     config.timeout = timeout;
-    config.reconnect_timeout = Duration::from_secs(20);
     register_vfs(config)
 }
 

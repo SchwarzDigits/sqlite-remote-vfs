@@ -54,10 +54,12 @@ find_runner() {
     command -v wasm-bindgen-test-runner
     return
   fi
-  local cache
+  # The cache can hold several versions, installed for other projects. Take the one in Cargo.lock.
+  local version cache
+  version=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
   for cache in "$HOME/Library/Caches/.wasm-pack" "${XDG_CACHE_HOME:-$HOME/.cache}/.wasm-pack"; do
-    ls -t "$cache"/wasm-bindgen-cargo-install-*/wasm-bindgen-test-runner \
-      "$cache"/wasm-bindgen-cargo-install-*/bin/wasm-bindgen-test-runner 2> /dev/null || true
+    ls "$cache/wasm-bindgen-cargo-install-$version/wasm-bindgen-test-runner" \
+      "$cache/wasm-bindgen-cargo-install-$version/bin/wasm-bindgen-test-runner" 2> /dev/null || true
   done | head -1
 }
 

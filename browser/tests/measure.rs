@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OpenFlags};
-use sqlite_remote_vfs::{Config, Load, Local, Memory, RemoteVfs, Signer};
+use sqlite_remote_vfs::{Cache, Load, Memory, RemoteVfs, Signer};
 use sqlite_wasm_rs as _;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -47,11 +47,10 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{hex}-{}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-async fn register(url: &str, subject: &Arc<dyn Signer>, local: Local) -> RemoteVfs {
-    let mut config = Config::new(url, subject.clone());
+async fn register(url: &str, subject: &Arc<dyn Signer>, cache: Cache) -> RemoteVfs {
+    let mut config = common::config(url, subject, cache);
     config.takeover = true;
     config.load = Load::Preload;
-    config.local = local;
     RemoteVfs::register_async(&unique("vfs"), config)
         .await
         .expect("register the VFS")
@@ -79,9 +78,9 @@ async fn measure_commit_and_reopen_with_local_copy() {
     console::log_1(&"| Local copy | p50 commit | p99 commit | DB | Pages | Reopen | Fetches |".into());
     console::log_1(&"|---|---|---|---|---|---|---|".into());
 
-    for (label, local) in [("no", Local::None), ("yes", Local::Browser)] {
+    for (label, cache) in [("no", Cache::None), ("yes", Cache::Browser)] {
         let subject = common::key();
-        let vfs = register(url, &subject, local.clone()).await;
+        let vfs = register(url, &subject, cache.clone()).await;
         let conn = open(&vfs);
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB)")
             .expect("create");
@@ -101,7 +100,7 @@ async fn measure_commit_and_reopen_with_local_copy() {
 
         // Time to reopen: with a local copy the blocks come from IndexedDB, without one from the server.
         let opened = now();
-        let again = register(url, &subject, local).await;
+        let again = register(url, &subject, cache).await;
         let conn = open(&again);
         let rows: i64 = conn.query_row("SELECT count(*) FROM t", [], |row| row.get(0)).unwrap();
         let elapsed = now() - opened;
@@ -131,9 +130,9 @@ async fn measure_reopen_over_slow_line() {
     console::log_1(&"| Local copy | DB | Pages | Reopen over slow line | Fetches |".into());
     console::log_1(&"|---|---|---|---|---|".into());
 
-    for (label, local) in [("no", Local::None), ("yes", Local::Browser)] {
+    for (label, cache) in [("no", Cache::None), ("yes", Cache::Browser)] {
         let subject = common::key();
-        let vfs = register(url, &subject, local.clone()).await;
+        let vfs = register(url, &subject, cache.clone()).await;
         let conn = open(&vfs);
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, payload BLOB)")
             .expect("create");
@@ -152,7 +151,7 @@ async fn measure_reopen_over_slow_line() {
         drop(vfs);
 
         let opened = now();
-        let again = register(slow, &subject, local).await;
+        let again = register(slow, &subject, cache).await;
         let conn = open(&again);
         let rows: i64 = conn.query_row("SELECT count(*) FROM t", [], |row| row.get(0)).unwrap();
         let elapsed = now() - opened;
@@ -186,10 +185,9 @@ async fn one_memory_limit_table(url: &str, block: u32) {
 
     // Build the database once, with a local copy, so every case below starts from the same complete local copy.
     let vfs = {
-        let mut config = Config::new(url, subject.clone());
+        let mut config = common::config(url, &subject, Cache::Browser);
         config.takeover = true;
         config.load = Load::Preload;
-        config.local = Local::Browser;
         config.page_size = block;
         RemoteVfs::register_async(&unique("vfs"), config)
             .await
@@ -233,10 +231,9 @@ async fn one_memory_limit_table(url: &str, block: u32) {
         ("2 MB", Memory::Blocks(2 * per_mb)),
         ("512 KB", Memory::Blocks(per_mb / 2)),
     ] {
-        let mut config = Config::new(url, subject.clone());
+        let mut config = common::config(url, &subject, Cache::Browser);
         config.takeover = true;
         config.load = Load::OnDemand { blocks_per_fetch: 16 };
-        config.local = Local::Browser;
         config.memory = memory;
         config.page_size = block;
         let vfs = RemoteVfs::register_async(&unique("vfs"), config)

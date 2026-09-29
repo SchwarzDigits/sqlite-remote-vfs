@@ -69,7 +69,7 @@ async fn browser_storage_stays_empty() {
 
     let before = stored_bytes().await;
 
-    let mut config = Config::new(url, subject.clone());
+    let mut config = Config::server(url, subject.clone());
     config.takeover = true;
     config.load = Load::Preload;
     let vfs = RemoteVfs::register_async(&unique("vfs"), config)
@@ -127,7 +127,7 @@ async fn browser_storage_stays_empty() {
 
     // The data is on the server. A second VFS reads it back.
     let reader = RemoteVfs::register_async(&unique("vfs"), {
-        let mut config = Config::new(url, subject.clone());
+        let mut config = Config::server(url, subject.clone());
         config.takeover = true;
         config
     })

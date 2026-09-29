@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
-use sqlite_remote_vfs::{Config, RemoteVfs};
+use sqlite_remote_vfs::{Config, RemoteVfs, Server, Store};
 
 use crate::rng::Rng;
 use crate::workload;
@@ -234,11 +234,12 @@ fn client(url: &str, seconds: u64, rate: f64, kind: Kind, seed: u64, start: &Bar
 }
 
 fn open(url: &str, key: &str) -> Result<(RemoteVfs, Connection), String> {
-    let mut config = Config::new(url, crate::key::signer(key)?);
+    let mut server = Server::new(url, crate::key::signer(key)?);
+    server.reconnect_timeout = Duration::from_secs(30);
+    let mut config = Config::new(Store::Server(server));
     config.takeover = true;
     // Many simultaneous logins can be slow. A long timeout lets the run report slow logins instead of failing.
     config.timeout = Duration::from_secs(30);
-    config.reconnect_timeout = Duration::from_secs(30);
     let vfs = crate::register_vfs(config)?;
     let conn = workload::open(&vfs, DB).map_err(|err| err.to_string())?;
     Ok((vfs, conn))

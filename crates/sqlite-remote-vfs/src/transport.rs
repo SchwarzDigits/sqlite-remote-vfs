@@ -554,7 +554,7 @@ mod imp {
             ("url", config.url.as_str().into()),
             (
                 "copyPrefix",
-                format!("sqlite-remote-vfs-copy-{}", crate::subject(&*config.signer))
+                format!("sqlite-remote-vfs-cache-{}", crate::subject(&*config.signer))
                     .as_str()
                     .into(),
             ),

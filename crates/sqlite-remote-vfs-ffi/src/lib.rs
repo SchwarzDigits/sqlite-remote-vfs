@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sqlite_remote_vfs::{Algorithm, Config, Load, Local, Memory, RemoteVfs, Signer};
+use sqlite_remote_vfs::{Algorithm, Cache, Config, Load, Memory, RemoteVfs, Server, Signer, Store};
 
 // The unit test binary links SQLite from the dev-dependency. The MSVC linker requires every SQLite function that
 // rsqlite-vfs declares, also when no test calls it.
@@ -167,12 +167,31 @@ unsafe fn config(c: &SqliteRemoteVfsConfig) -> Result<Config, Failure> {
         context: c.sign_context,
     };
 
-    let mut config = Config::new(url, Arc::new(signer));
+    let mut server = Server::new(url, Arc::new(signer));
     if !c.local_copy_path.is_null() {
         // SAFETY: per the header.
         let path = unsafe { string(c.local_copy_path, "local_copy_path") }?;
-        config.local = Local::File(PathBuf::from(path));
+        server.cache = Cache::File(PathBuf::from(path));
     }
+    if c.reconnect_timeout_ms > 0 {
+        server.reconnect_timeout = Duration::from_millis(c.reconnect_timeout_ms.into());
+    }
+    if c.extra_roots_count > 0 {
+        if c.extra_roots.is_null() || c.extra_root_lens.is_null() {
+            return Err(misuse(
+                "extra_roots and extra_root_lens are required with extra_roots_count",
+            ));
+        }
+        for i in 0..c.extra_roots_count {
+            // SAFETY: both arrays have extra_roots_count elements per the header.
+            let (ptr, len) = unsafe { (*c.extra_roots.add(i), *c.extra_root_lens.add(i)) };
+            // SAFETY: per the header.
+            server
+                .extra_roots
+                .push(unsafe { bytes(ptr, len, "extra_roots entry") }?);
+        }
+    }
+    let mut config = Config::new(Store::Server(server));
     if c.memory_blocks > 0 {
         config.memory = Memory::Blocks(c.memory_blocks);
     }
@@ -187,25 +206,7 @@ unsafe fn config(c: &SqliteRemoteVfsConfig) -> Result<Config, Failure> {
     if c.timeout_ms > 0 {
         config.timeout = Duration::from_millis(c.timeout_ms.into());
     }
-    if c.reconnect_timeout_ms > 0 {
-        config.reconnect_timeout = Duration::from_millis(c.reconnect_timeout_ms.into());
-    }
     config.takeover = c.takeover != 0;
-    if c.extra_roots_count > 0 {
-        if c.extra_roots.is_null() || c.extra_root_lens.is_null() {
-            return Err(misuse(
-                "extra_roots and extra_root_lens are required with extra_roots_count",
-            ));
-        }
-        for i in 0..c.extra_roots_count {
-            // SAFETY: both arrays have extra_roots_count elements per the header.
-            let (ptr, len) = unsafe { (*c.extra_roots.add(i), *c.extra_root_lens.add(i)) };
-            // SAFETY: per the header.
-            config
-                .extra_roots
-                .push(unsafe { bytes(ptr, len, "extra_roots entry") }?);
-        }
-    }
     Ok(config)
 }
 

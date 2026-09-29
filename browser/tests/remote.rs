@@ -34,7 +34,7 @@ fn unique(prefix: &str) -> String {
 }
 
 async fn register(url: &str, subject: &Arc<dyn Signer>) -> RemoteVfs {
-    let mut config = Config::new(url, subject.clone());
+    let mut config = Config::server(url, subject.clone());
     // An earlier test may still hold the lease if its connection has not closed yet.
     config.takeover = true;
     config.load = Load::Preload;

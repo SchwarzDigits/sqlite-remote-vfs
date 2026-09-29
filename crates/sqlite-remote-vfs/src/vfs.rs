@@ -21,18 +21,38 @@ use rsqlite_vfs::{
 use crate::client::Client;
 use crate::database::{Database, OpenOptions};
 use crate::platform;
-use crate::{Config, Load, Local, Memory, Stats};
+use crate::{Cache, Config, Load, Memory, Server, Stats};
 
 pub(crate) struct Inner {
     pub config: Config,
-    /// Local copy held by the connection worker, in a browser only. It is passed to the database when it is opened.
-    /// Natively, the local copy is the file named in `Config::local`.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    pub browser_local: Mutex<Option<Box<dyn crate::local::LocalStore>>>,
-    pub client: Mutex<Client>,
+    pub backend: Backend,
     pub files: Mutex<Files>,
     pub stats: Mutex<Stats>,
     pub closed: AtomicBool,
+}
+
+/// Where the databases of a VFS are stored.
+pub(crate) enum Backend {
+    Server(ServerBackend),
+}
+
+/// Connection to the page server.
+pub(crate) struct ServerBackend {
+    pub settings: Server,
+    pub client: Mutex<Client>,
+    /// Cache held by the connection worker, in a browser only. It is passed to the database when it is opened.
+    /// Natively, the cache is the file named in `Server::cache`.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    pub browser_cache: Mutex<Option<Box<dyn crate::local::LocalStore>>>,
+}
+
+impl Inner {
+    /// The server backend. Only files and operations of a VFS with a server call this.
+    pub fn server(&self) -> &ServerBackend {
+        match &self.backend {
+            Backend::Server(server) => server,
+        }
+    }
 }
 
 /// Files open on this VFS.
@@ -77,9 +97,13 @@ impl MainFile {
     /// Commits the transaction to the server. On failure, SQLite gets `SQLITE_IOERR_FSYNC` and rolls back, as on a
     /// failing disk.
     fn commit(&mut self) -> VfsResult<()> {
-        let timeout = self.inner.config.reconnect_timeout;
+        let server = self.inner.server();
         self.db
-            .commit(&mut lock(&self.inner.client), timeout, &mut lock(&self.inner.stats))
+            .commit(
+                &mut lock(&server.client),
+                server.settings.reconnect_timeout,
+                &mut lock(&self.inner.stats),
+            )
             .map_err(|broken| io_error(VfsErrorCode::IoSync, format!("commit failed: {broken:?}")))
     }
 }
@@ -90,7 +114,12 @@ impl VfsFile for RemoteFile {
             RemoteFile::Main(main) => {
                 let full = main
                     .db
-                    .read(&mut lock(&main.inner.client), buf, offset, &mut lock(&main.inner.stats))
+                    .read(
+                        &mut lock(&main.inner.server().client),
+                        buf,
+                        offset,
+                        &mut lock(&main.inner.stats),
+                    )
                     .map_err(|broken| io_error(VfsErrorCode::IoRead, format!("{broken:?}")))?;
                 if full {
                     return Ok(buf.len());
@@ -107,7 +136,12 @@ impl VfsFile for RemoteFile {
         match self {
             RemoteFile::Main(main) => main
                 .db
-                .write(&mut lock(&main.inner.client), buf, offset, &mut lock(&main.inner.stats))
+                .write(
+                    &mut lock(&main.inner.server().client),
+                    buf,
+                    offset,
+                    &mut lock(&main.inner.stats),
+                )
                 .map_err(|broken| io_error(VfsErrorCode::IoWrite, format!("{broken:?}"))),
             RemoteFile::Temp(temp) => lock(temp).write(buf, offset),
         }
@@ -216,13 +250,13 @@ impl VfsStore for Store {
     fn close_file(data: &AppData, name: Option<&str>, file: RemoteFile, options: FileOptions) -> VfsResult<()> {
         match file {
             RemoteFile::Main(main) => {
-                main.db.close(&mut lock(&main.inner.client));
-                // In a browser the local copy store exists once per VFS. Hand it back for the next database.
+                main.db.close(&mut lock(&main.inner.server().client));
+                // In a browser the cache store exists once per VFS. Hand it back for the next database.
                 #[cfg(target_arch = "wasm32")]
                 {
                     let mut main = main;
                     if let Some(store) = main.db.take_local() {
-                        *lock(&data.browser_local) = Some(store);
+                        *lock(&data.server().browser_cache) = Some(store);
                     }
                 }
                 lock(&data.files).database = None;
@@ -317,40 +351,48 @@ impl SQLiteVfs<Io> for Vfs {
     }
 }
 
-/// Creates the local copy store configured in `Config::local` and selects database `name` in it.
-fn local_store(data: &AppData, name: &str) -> Option<Box<dyn crate::local::LocalStore>> {
-    let mut store: Box<dyn crate::local::LocalStore> = match &data.config.local {
-        Local::None => return None,
+/// Creates the cache store configured in `Server::cache` and selects database `name` in it.
+fn cache_store(data: &AppData, name: &str) -> Option<Box<dyn crate::local::LocalStore>> {
+    let server = data.server();
+    let mut store: Box<dyn crate::local::LocalStore> = match &server.settings.cache {
+        Cache::None => return None,
         #[cfg(not(target_arch = "wasm32"))]
-        Local::File(path) => Box::new(crate::local::FileStore::new(path)),
+        Cache::File(path) => Box::new(crate::local::FileStore::new(path)),
         // Held by the connection worker. It was passed in when the VFS was registered and keeps one IndexedDB database
         // per database name.
         #[cfg(target_arch = "wasm32")]
-        Local::Browser => lock(&data.browser_local).take()?,
+        Cache::Browser => lock(&server.browser_cache).take()?,
     };
     match store.select(name) {
         Ok(()) => Some(store),
-        // Without a local copy the database is read from the server.
+        // Without a cache the database is read from the server.
         Err(_) => {
             #[cfg(target_arch = "wasm32")]
             {
-                *lock(&data.browser_local) = Some(store);
+                *lock(&server.browser_cache) = Some(store);
             }
             None
         }
     }
 }
 
-/// Deletes a database on the page server, then its local copy if the copy belongs to it. Fails if the database is
-/// open on this VFS.
+/// Deletes a database. Fails if the database is open on this VFS.
 pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), String> {
     // Held throughout, so that the database cannot be opened while it is being deleted.
     let files = lock(&data.files);
     if files.database.as_deref() == Some(name) {
         return Err(format!("{name} is open; close it before deleting it"));
     }
+    match &data.backend {
+        Backend::Server(_) => delete_on_server(data, name),
+    }
+}
+
+/// Deletes a database on the page server, then its cache if the cache belongs to it.
+fn delete_on_server(data: &AppData, name: &str) -> Result<(), String> {
+    let server = data.server();
     {
-        let mut client = lock(&data.client);
+        let mut client = lock(&server.client);
         if !client.is_connected() {
             client.reconnect().map_err(|err| err.to_string())?;
         }
@@ -359,10 +401,10 @@ pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), String> 
             .map_err(|err| format!("deleting {name}: {err}"))?;
     }
 
-    let Some(mut store) = local_store(data, name) else {
+    let Some(mut store) = cache_store(data, name) else {
         return Ok(());
     };
-    let subject = crate::subject(&*data.config.signer);
+    let subject = crate::subject(&*server.settings.signer);
     let result = match store.head() {
         Ok(Some(head)) if head.subject == subject && head.db_id == name => store.clear(),
         Ok(_) => Ok(()),
@@ -370,9 +412,9 @@ pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), String> 
     };
     #[cfg(target_arch = "wasm32")]
     {
-        *lock(&data.browser_local) = Some(store);
+        *lock(&server.browser_cache) = Some(store);
     }
-    result.map_err(|err| format!("{name} was deleted on the server, but its local copy was not: {err}"))
+    result.map_err(|err| format!("{name} was deleted on the server, but its cache was not: {err}"))
 }
 
 /// Opens the database on the page server. Fails if this VFS already has a database open.
@@ -387,7 +429,8 @@ fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Database
         return Err(io_error(VfsErrorCode::CantOpen, reason));
     }
 
-    let mut client = lock(&data.client);
+    let server = data.server();
+    let mut client = lock(&server.client);
     if !client.is_connected() {
         client
             .reconnect()
@@ -405,8 +448,8 @@ fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Database
             Memory::Unlimited => None,
             Memory::Blocks(blocks) => Some(blocks),
         },
-        subject: crate::subject(&*data.config.signer),
-        local: local_store(data, name),
+        subject: crate::subject(&*server.settings.signer),
+        local: cache_store(data, name),
     };
     match Database::open(&mut client, name, options, &mut lock(&data.stats)) {
         Ok(db) => {

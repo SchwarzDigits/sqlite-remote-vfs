@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::{Connection, OpenFlags};
-use sqlite_remote_vfs::{Algorithm, Config, Local, RemoteVfs, Signer};
+use sqlite_remote_vfs::{Algorithm, Cache, Config, RemoteVfs, Server, Signer, Store};
 
 const KEY: &str = "x'1111111111111111111111111111111111111111111111111111111111111111'";
 const MARKER: &[u8] = b"sqlcipher-marker-7f3a9c";
@@ -124,9 +124,9 @@ fn database_on_server_is_encrypted() {
     let copy = temp_path("local.copy");
 
     // Write with a local copy. The local copy holds exactly the blocks the server acknowledged.
-    let mut config = Config::new(&url, signer.clone());
-    config.local = Local::File(copy.clone());
-    let vfs = register(config);
+    let mut server = Server::new(&url, signer.clone());
+    server.cache = Cache::File(copy.clone());
+    let vfs = register(Config::new(Store::Server(server)));
     let conn = open(&vfs, Some(KEY));
     write_rows(&conn);
     drop(conn);
@@ -144,7 +144,7 @@ fn database_on_server_is_encrypted() {
     );
 
     // Reopen from the server, without a local copy.
-    let vfs = register(Config::new(&url, signer.clone()));
+    let vfs = register(Config::server(&url, signer.clone()));
     let conn = open(&vfs, Some(KEY));
     let rows: i64 = conn
         .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
@@ -154,7 +154,7 @@ fn database_on_server_is_encrypted() {
     drop(vfs);
 
     // Without the key the database cannot be read.
-    let vfs = register(Config::new(&url, signer));
+    let vfs = register(Config::server(&url, signer));
     let conn = open(&vfs, None);
     let result = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0));
     assert!(result.is_err(), "reading without the key must fail");

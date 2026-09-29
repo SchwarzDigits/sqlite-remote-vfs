@@ -13,7 +13,7 @@
 //! the databases from the public key. The client cannot choose the subject.
 //!
 //! The connection uses `wss://` or `ws://`. For `wss://` the client trusts the certificate authorities of the
-//! operating system and those in `Config::extra_roots`.
+//! operating system and those in `Server::extra_roots`.
 //!
 //! Current limits: one database per registered VFS, one connection per database.
 
@@ -40,7 +40,7 @@ use rsqlite_vfs::{register_vfs, registered_vfs};
 pub use crate::identity::{Algorithm, Shared, Signer, subject};
 
 use crate::client::{Client, ClientConfig};
-use crate::vfs::{Files, Inner, Io, Vfs, lock};
+use crate::vfs::{Backend, Files, Inner, Io, ServerBackend, Vfs, lock};
 
 /// When blocks are loaded from the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,34 +58,48 @@ pub enum Memory {
     #[default]
     Unlimited,
     /// Keep at most this many blocks in memory. Beyond that, the least recently used blocks are evicted and
-    /// reloaded on demand from the local copy, or from the server if the local copy does not have them. Blocks
-    /// modified since the last commit are never evicted, because the server does not have them yet.
+    /// reloaded on access: with a server from the [`Cache`] or the server, locally from IndexedDB. Blocks modified
+    /// since the last commit are never evicted.
     ///
-    /// Most useful together with a [`Local`] copy, which reloads a block in a fraction of a millisecond.
+    /// With a server, most useful together with a [`Cache`], which reloads a block in a fraction of a millisecond.
     Blocks(u64),
 }
 
-/// Optional local copy of the database. Reads it can serve need no network round trip.
+/// Optional cache of the server's database on this device. Reads it can serve need no network round trip.
 ///
-/// The server is authoritative. Blocks are written to the local copy only after the server has acknowledged the
-/// commit. A missing, outdated or damaged local copy therefore only causes additional fetches from the server.
+/// The server is authoritative. Blocks are written to the cache only after the server has acknowledged the commit. A
+/// missing, outdated or damaged cache therefore only causes additional fetches from the server.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum Local {
-    /// No local copy. Every block is fetched from the server.
+pub enum Cache {
+    /// No cache. Every block is fetched from the server.
     #[default]
     None,
-    /// Local copy in this file.
+    /// Cache in this file.
     #[cfg(not(target_arch = "wasm32"))]
     File(std::path::PathBuf),
-    /// Local copy in IndexedDB, managed by the connection worker: one IndexedDB database per database, named
-    /// `sqlite-remote-vfs-copy-<subject>/<database>`.
+    /// Cache in IndexedDB, managed by the connection worker: one IndexedDB database per database, named
+    /// `sqlite-remote-vfs-cache-<subject>/<database>`.
     #[cfg(target_arch = "wasm32")]
     Browser,
 }
 
-/// Configuration for [`RemoteVfs`].
+/// Where the databases of a [`RemoteVfs`] are stored.
 #[derive(Clone, Debug)]
-pub struct Config {
+pub enum Store {
+    /// On a page server, which is authoritative.
+    Server(Server),
+    /// Only in this browser, in IndexedDB, without a server. For development, demos, tests and deployments without a
+    /// server. The data is lost when the user clears the site data.
+    ///
+    /// Each database is an IndexedDB database named `sqlite-remote-vfs-local/<namespace>/<database>`. The namespace
+    /// keeps the databases of different applications or users apart and must not contain `/`.
+    #[cfg(target_arch = "wasm32")]
+    Local { namespace: String },
+}
+
+/// Connection to the page server.
+#[derive(Clone, Debug)]
+pub struct Server {
     /// WebSocket URL of the page server, e.g. `wss://vfs.example/v1/ws`. `ws://` is for a server on the same machine
     /// or behind a proxy that terminates TLS.
     pub url: String,
@@ -93,24 +107,14 @@ pub struct Config {
     pub signer: Arc<dyn Signer>,
     /// Identifier of this client instance. Random if `None`.
     pub instance_id: Option<[u8; 16]>,
-    /// Page size for new databases. SQLite3 Multiple Ciphers uses 4096 in SQLCipher format.
-    pub page_size: u32,
-    /// When blocks are loaded from the server.
-    pub load: Load,
-    /// Optional local copy. It may be incomplete: blocks it does not have are fetched from the server and then added
-    /// to it.
-    pub local: Local,
-    /// Limit on the number of blocks kept in memory.
-    pub memory: Memory,
-    /// Take the lease even if another instance holds it.
-    pub takeover: bool,
+    /// Optional cache on this device. It may be incomplete: blocks it does not have are fetched from the server and
+    /// then added to it.
+    pub cache: Cache,
+    /// How long a commit tries to reconnect before it fails.
+    pub reconnect_timeout: Duration,
     /// Record the block ranges of every fetch, readable with [`RemoteVfs::fetch_trace`]. Useful for analysing the
     /// round trips of a query. The list grows for the lifetime of the VFS.
     pub trace_fetches: bool,
-    /// Timeout for connecting and for each response.
-    pub timeout: Duration,
-    /// How long a commit tries to reconnect before it fails.
-    pub reconnect_timeout: Duration,
     /// Additional DER-encoded CA certificates to trust for `wss://`, on top of those of the operating system. Needed
     /// when the server certificate is issued by a CA the system does not know, for example an organisation's
     /// internal CA. Not available in a browser, where the browser decides which CAs to trust.
@@ -118,25 +122,65 @@ pub struct Config {
     pub extra_roots: Vec<Vec<u8>>,
 }
 
-impl Config {
-    /// Returns a configuration with the defaults: page size 4096, preload, no local copy, no memory limit, no
-    /// takeover, 10 s timeout and 10 s reconnect timeout.
+impl Server {
+    /// Returns server settings with the defaults: no cache, a random instance identifier, 10 s reconnect timeout.
     pub fn new(url: impl Into<String>, signer: Arc<dyn Signer>) -> Self {
-        Config {
+        Server {
             url: url.into(),
             signer,
             instance_id: None,
-            page_size: 4096,
-            load: Load::Preload,
-            local: Local::None,
-            memory: Memory::Unlimited,
-            takeover: false,
-            trace_fetches: false,
-            timeout: Duration::from_secs(10),
+            cache: Cache::None,
             reconnect_timeout: Duration::from_secs(10),
+            trace_fetches: false,
             #[cfg(not(target_arch = "wasm32"))]
             extra_roots: Vec::new(),
         }
+    }
+}
+
+/// Configuration for [`RemoteVfs`].
+#[derive(Clone, Debug)]
+pub struct Config {
+    /// Where the databases are stored.
+    pub store: Store,
+    /// Page size for new databases. SQLite3 Multiple Ciphers uses 4096 in SQLCipher format.
+    pub page_size: u32,
+    /// When blocks are loaded: from the server, or locally from IndexedDB.
+    pub load: Load,
+    /// Limit on the number of blocks kept in memory.
+    pub memory: Memory,
+    /// Open a database even if another instance has it open. With a server, the lease is taken over; locally, the
+    /// lock is. The other instance can then no longer commit.
+    pub takeover: bool,
+    /// Timeout for connecting and for each response of the server, or of the connection worker in a browser.
+    pub timeout: Duration,
+}
+
+impl Config {
+    /// Returns a configuration with the defaults: page size 4096, preload, no memory limit, no takeover, 10 s timeout.
+    pub fn new(store: Store) -> Self {
+        Config {
+            store,
+            page_size: 4096,
+            load: Load::Preload,
+            memory: Memory::Unlimited,
+            takeover: false,
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    /// Configuration for databases on a page server, with the defaults of [`Config::new`] and [`Server::new`].
+    pub fn server(url: impl Into<String>, signer: Arc<dyn Signer>) -> Self {
+        Config::new(Store::Server(Server::new(url, signer)))
+    }
+
+    /// Configuration for databases kept only in this browser, with the defaults of [`Config::new`]. See
+    /// [`Store::Local`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn local(namespace: impl Into<String>) -> Self {
+        Config::new(Store::Local {
+            namespace: namespace.into(),
+        })
     }
 }
 
@@ -198,69 +242,50 @@ pub struct RemoteVfs {
 impl RemoteVfs {
     /// Connects to the page server, logs in, and registers the VFS with SQLite under `name`.
     pub fn register(name: &str, config: Config) -> Result<Self, Error> {
-        let client_config = Self::prepare(name, &config)?;
-        let url = config.url.clone();
-        let client = Client::connect(client_config).map_err(|err| Error(format!("{url}: {err}")))?;
-        Self::finish(name, config, client, None)
+        check_name(name)?;
+        let settings = match &config.store {
+            Store::Server(settings) => settings.clone(),
+            #[cfg(target_arch = "wasm32")]
+            Store::Local { .. } => return Err(Error("local databases need RemoteVfs::register_async".into())),
+        };
+        let client_config = client_config(&settings, config.timeout);
+        let client = Client::connect(client_config).map_err(|err| Error(format!("{}: {err}", settings.url)))?;
+        Self::finish(name, config, server_backend(settings, client, None))
     }
 
-    /// Browser variant of `register`. Starts the connection worker, connects and logs in.
+    /// Browser variant of `register`. With a server, starts the connection worker, connects and logs in.
     ///
     /// Starting a worker needs a running event loop. Call this before opening a database: while SQLite runs, the
     /// SQLite worker is blocked and cannot start a worker.
     #[cfg(target_arch = "wasm32")]
     pub async fn register_async(name: &str, config: Config) -> Result<Self, Error> {
-        let client_config = Self::prepare(name, &config)?;
-        let url = config.url.clone();
-        let (transport, local) = crate::transport::start(&client_config)
-            .await
-            .map_err(|err| Error(format!("{url}: {err}")))?;
-        let client = Client::with_transport(transport, client_config).map_err(|err| Error(format!("{url}: {err}")))?;
-        Self::finish(name, config, client, Some(local))
-    }
-
-    /// Rejects a name SQLite already knows and chooses the instance identifier.
-    fn prepare(name: &str, config: &Config) -> Result<ClientConfig, Error> {
-        // SAFETY: the lookup only reads SQLite's list of VFSes. The caller registers a VFS once, from one thread, so
-        // the lookup does not run concurrently with a registration.
-        if unsafe { registered_vfs(name) }
-            .map_err(|err| Error(err.to_string()))?
-            .is_some()
-        {
-            return Err(Error(format!("a VFS named {name} is already registered")));
+        check_name(name)?;
+        match &config.store {
+            Store::Server(settings) => {
+                let settings = settings.clone();
+                let client_config = client_config(&settings, config.timeout);
+                let url = settings.url.clone();
+                let (transport, cache) = crate::transport::start(&client_config)
+                    .await
+                    .map_err(|err| Error(format!("{url}: {err}")))?;
+                let client =
+                    Client::with_transport(transport, client_config).map_err(|err| Error(format!("{url}: {err}")))?;
+                Self::finish(name, config, server_backend(settings, client, Some(cache)))
+            }
+            Store::Local { .. } => Err(Error("local databases are not supported yet".into())),
         }
-        let instance_id = config.instance_id.unwrap_or_else(|| {
-            let mut id = [0u8; 16];
-            getrandom::fill(&mut id).expect("OS randomness");
-            id
-        });
-        Ok(ClientConfig {
-            url: config.url.clone(),
-            signer: Arc::clone(&config.signer),
-            instance_id,
-            timeout: config.timeout,
-            trace_fetches: config.trace_fetches,
-            #[cfg(not(target_arch = "wasm32"))]
-            extra_roots: config.extra_roots.clone(),
-        })
     }
 
     /// Creates the shared state, registers the VFS with SQLite and starts the ping thread.
-    fn finish(
-        name: &str,
-        config: Config,
-        client: Client,
-        local: Option<Box<dyn crate::local::LocalStore>>,
-    ) -> Result<Self, Error> {
+    fn finish(name: &str, config: Config, backend: Backend) -> Result<Self, Error> {
         // In a browser `Inner` is used by a single worker, and its transport holds JavaScript values, which are
         // neither `Send` nor `Sync`.
         #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
         let inner = Arc::new(Inner {
             config,
-            client: Mutex::new(client),
+            backend,
             files: Mutex::new(Files::default()),
             stats: Mutex::new(Stats::default()),
-            browser_local: Mutex::new(local),
             closed: AtomicBool::new(false),
         });
         // SAFETY: `Io`, `Vfs` and their callbacks agree on the VFS version, the file layout and the app data type.
@@ -287,9 +312,11 @@ impl RemoteVfs {
         format!("multipleciphers-{}", self.name)
     }
 
-    /// Block ranges fetched so far, in order. Empty unless [`Config::trace_fetches`] is set.
+    /// Block ranges fetched from the server so far, in order. Empty unless [`Server::trace_fetches`] is set.
     pub fn fetch_trace(&self) -> Vec<(u64, u64)> {
-        lock(&self.inner.client).fetch_trace()
+        match &self.inner.backend {
+            Backend::Server(server) => lock(&server.client).fetch_trace(),
+        }
     }
 
     /// Returns the current counters.
@@ -297,19 +324,23 @@ impl RemoteVfs {
         *lock(&self.inner.stats)
     }
 
-    /// Deletes the database `name` on the server, and its local copy. The database must not be open on this VFS.
+    /// Deletes the database `name`: on the server together with its cache, or locally. The database must not be open
+    /// on this VFS.
     ///
-    /// While another instance holds an unexpired lease on it, deleting fails unless [`Config::takeover`] is set; that
-    /// instance then can no longer commit. Deleting a database that does not exist succeeds. Opening `name` again
-    /// with `SQLITE_OPEN_CREATE` creates it empty, and it may then use another page size and another key.
+    /// While another instance has it open, deleting fails unless [`Config::takeover`] is set; that instance then can
+    /// no longer commit. Deleting a database that does not exist succeeds. Opening `name` again with
+    /// `SQLITE_OPEN_CREATE` creates it empty, and it may then use another page size and another key.
     pub fn delete_database(&self, name: &str) -> Result<(), Error> {
         crate::vfs::delete_database(&self.inner, name).map_err(Error)
     }
 
-    /// Marks the connection as broken, as after a network failure. The next request reconnects. For tests.
+    /// Marks the connection to the server as broken, as after a network failure. The next request reconnects. For
+    /// tests.
     #[doc(hidden)]
     pub fn drop_connection(&self) {
-        lock(&self.inner.client).disconnect();
+        match &self.inner.backend {
+            Backend::Server(server) => lock(&server.client).disconnect(),
+        }
     }
 }
 
@@ -318,6 +349,45 @@ impl Drop for RemoteVfs {
     fn drop(&mut self) {
         self.inner.closed.store(true, Ordering::Relaxed);
     }
+}
+
+/// Rejects a name SQLite already knows.
+fn check_name(name: &str) -> Result<(), Error> {
+    // SAFETY: the lookup only reads SQLite's list of VFSes. The caller registers a VFS once, from one thread, so the
+    // lookup does not run concurrently with a registration.
+    if unsafe { registered_vfs(name) }
+        .map_err(|err| Error(err.to_string()))?
+        .is_some()
+    {
+        return Err(Error(format!("a VFS named {name} is already registered")));
+    }
+    Ok(())
+}
+
+/// Client settings for a server, with a random instance identifier unless one is set.
+fn client_config(settings: &Server, timeout: Duration) -> ClientConfig {
+    let instance_id = settings.instance_id.unwrap_or_else(|| {
+        let mut id = [0u8; 16];
+        getrandom::fill(&mut id).expect("OS randomness");
+        id
+    });
+    ClientConfig {
+        url: settings.url.clone(),
+        signer: Arc::clone(&settings.signer),
+        instance_id,
+        timeout,
+        trace_fetches: settings.trace_fetches,
+        #[cfg(not(target_arch = "wasm32"))]
+        extra_roots: settings.extra_roots.clone(),
+    }
+}
+
+fn server_backend(settings: Server, client: Client, cache: Option<Box<dyn crate::local::LocalStore>>) -> Backend {
+    Backend::Server(ServerBackend {
+        settings,
+        client: Mutex::new(client),
+        browser_cache: Mutex::new(cache),
+    })
 }
 
 /// Starts a thread that pings the server while SQLite is idle, to keep the connection and the leases alive.
@@ -330,10 +400,11 @@ fn spawn_pinger(inner: Arc<Inner>) {
     let spawned = std::thread::Builder::new()
         .name("sqlite-remote-vfs-ping".into())
         .spawn(move || {
+            let server = inner.server();
             while !inner.closed.load(Ordering::Relaxed) {
-                let interval = lock(&inner.client).limits().ping_interval;
+                let interval = lock(&server.client).limits().ping_interval;
                 platform::sleep(interval / 2);
-                let mut client = lock(&inner.client);
+                let mut client = lock(&server.client);
                 if client.is_connected() && client.idle_for() >= interval / 2 {
                     let now = platform::epoch_millis().max(0) as u64;
                     // A failed ping marks the connection as broken. The next commit reconnects and resumes the

@@ -26,12 +26,12 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   challenge. Use a separate key for each server.
 - **One writer per database.** Opening a database acquires a lease. A newer lease has a higher epoch and fences off
   all older ones, so an outdated client cannot overwrite newer data.
-- **Deletion.** `RemoteVfs::delete_database` deletes a database on the server, and its local copy. Opened again with
+- **Deletion.** `RemoteVfs::delete_database` deletes a database on the server, and its cache. Opened again with
   `SQLITE_OPEN_CREATE`, it comes back empty and may use another page size and another key. A client that held a lease
   on the deleted database can no longer commit, also not after the database was created anew.
-- **Local copy (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
-  databases of one key keep their own copies. Reads are served from it without a round trip. It contains only data
-  the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale copy is
+- **Cache (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
+  databases of one key keep their own caches. Reads are served from it without a round trip. It contains only data
+  the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale cache is
   brought up to date from the server's change log: only the blocks changed since its version are discarded.
 - **Memory limit (optional).** `Memory::Blocks(n)` keeps at most `n` blocks in memory and evicts the least recently
   used. Blocks modified since the last commit are never evicted.
@@ -67,7 +67,7 @@ impl Signer for Key {
 }
 
 let signer: Arc<dyn Signer> = Arc::new(Key(signing_key));
-let vfs = RemoteVfs::register("remote", Config::new("wss://server.example/v1/ws", signer))?;
+let vfs = RemoteVfs::register("remote", Config::server("wss://server.example/v1/ws", signer))?;
 
 let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE;
 let conn = Connection::open_with_flags_and_vfs("app.db", flags, vfs.encrypted_name().as_str())?;
@@ -77,8 +77,10 @@ conn.pragma_update(None, "key", database_key)?;
 
 The example uses SQLite3 Multiple Ciphers. With SQLCipher, open through `vfs.name()` instead.
 
-`Config` also sets the page size (default 4096), the local copy, the memory limit, the loading mode, timeouts and
-lease takeover. `vfs.stats()` returns counters for commits, fetches, the local copy and evictions.
+`Config` also sets the page size (default 4096), the memory limit, the loading mode, the timeout and lease takeover.
+`Server` holds what only applies to a server: the cache, the reconnect timeout and additional CA certificates; build
+it with `Server::new` and pass `Config::new(Store::Server(server))`. `vfs.stats()` returns counters for commits,
+fetches, the cache and evictions.
 
 ### In the browser
 
@@ -88,7 +90,7 @@ lease takeover. `vfs.stats()` returns counters for commits, fetches, the local c
 - The page must be cross-origin isolated (`Cross-Origin-Opener-Policy: same-origin`,
   `Cross-Origin-Embedder-Policy: require-corp`), because the VFS uses `SharedArrayBuffer`.
 - The VFS starts a second worker that holds the WebSocket connection.
-- `Local::Browser` keeps the local copy in IndexedDB.
+- `Cache::Browser` keeps the cache in IndexedDB.
 
 `browser/` builds SQLite with SQLite3 Multiple Ciphers for the browser and contains the browser tests.
 
