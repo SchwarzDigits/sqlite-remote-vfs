@@ -201,7 +201,13 @@ impl Pages {
         Ok(true)
     }
 
-    pub fn write(&mut self, source: &mut dyn Source, data: &[u8], offset: u64, stats: &mut Stats) -> Result<(), Broken> {
+    pub fn write(
+        &mut self,
+        source: &mut dyn Source,
+        data: &[u8],
+        offset: u64,
+        stats: &mut Stats,
+    ) -> Result<(), Broken> {
         let page_size = self.page_size as u64;
         let mut done = 0usize;
         while done < data.len() {
