@@ -26,6 +26,7 @@ mod client;
 mod database;
 mod identity;
 mod local;
+mod pages;
 mod platform;
 mod transport;
 mod vfs;
