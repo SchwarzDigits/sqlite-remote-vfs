@@ -18,7 +18,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::Signer as _;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
-use sqlite_remote_vfs::{Algorithm, Config, RemoteVfs, Server, Signer, Store, TokenSource, Zeroizing};
+use sqlite_remote_vfs::{Algorithm, Config, Failure, RemoteVfs, Server, Signer, Store, TokenSource, Zeroizing};
 
 /// Private key of the test token service. Its public key is in `tests/data/token-jwks.json`.
 const SERVICE_SEED: [u8; 32] = [0x7a; 32];
@@ -240,6 +240,7 @@ fn commit_without_a_token_fails_with_sqlite_auth() {
         Some(ErrorCode::AuthorizationForStatementDenied),
         "{err}"
     );
+    assert_eq!(vfs.failure(), Some(Failure::Denied));
 }
 
 #[test]

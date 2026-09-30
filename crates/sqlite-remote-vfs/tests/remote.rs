@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
-use sqlite_remote_vfs::{Algorithm, Cache, Config, Load, Memory, RemoteVfs, Server, Signer, Store};
+use sqlite_remote_vfs::{Algorithm, Cache, Config, Failure, Load, Memory, RemoteVfs, Server, Signer, Store};
 
 const KEY: [u8; 32] = [0x11; 32];
 const OTHER_KEY: [u8; 32] = [0x22; 32];
@@ -134,12 +134,21 @@ fn takeover_sees_commits_and_fences_holder() {
     assert_eq!(count(&second_conn), 50);
 
     // The takeover revoked the first instance's lease, so its next write must fail.
+    assert_eq!(first.failure(), None, "nothing has failed yet");
     let err = first_conn
         .execute("INSERT INTO t (id, payload) VALUES (1000, x'00')", [])
         .unwrap_err();
     assert_eq!(err.sqlite_error_code(), Some(ErrorCode::SystemIoFailure), "{err}");
+    assert_eq!(first.failure(), Some(Failure::TakenOver));
+    assert_eq!(second.failure(), None);
     insert_rows(&second_conn, 50, 10, 200);
     assert_eq!(count(&second_conn), 60);
+
+    // Opening the database again clears the failure.
+    drop(first_conn);
+    drop(second_conn);
+    let _again = open(&first, "db", &KEY).unwrap();
+    assert_eq!(first.failure(), None);
 }
 
 #[test]
@@ -818,6 +827,24 @@ fn deletion_by_the_server_does_not_bring_back_the_local_copy() {
         0,
         "nothing is read from the old local copy"
     );
+}
+
+#[test]
+fn commit_to_a_lost_server_reports_unreachable() {
+    let Some(url) = server_url() else { return };
+    let proxy = Relay::start(&url);
+    let mut server = Server::new(proxy.url(), TestSigner::fresh());
+    server.reconnect_timeout = std::time::Duration::from_millis(500);
+    let vfs = register(Config::new(Store::Server(server)));
+    let conn = open(&vfs, "db", &KEY).unwrap();
+    conn.execute_batch(CREATE).unwrap();
+
+    proxy.stop();
+    let err = conn
+        .execute("INSERT INTO t (id, payload) VALUES (1, x'00')", [])
+        .expect_err("the server is gone");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::SystemIoFailure), "{err}");
+    assert_eq!(vfs.failure(), Some(Failure::Unreachable));
 }
 
 #[test]

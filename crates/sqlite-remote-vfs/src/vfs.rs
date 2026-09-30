@@ -23,13 +23,15 @@ use crate::database::{Broken, Database, OpenOptions};
 #[cfg(target_arch = "wasm32")]
 use crate::local_database::{LocalDatabase, LocalOptions};
 use crate::platform;
-use crate::{Cache, Config, Load, Memory, Server, Stats};
+use crate::{Cache, Config, Failure, Load, Memory, Server, Stats};
 
 pub(crate) struct Inner {
     pub config: Config,
     pub backend: Backend,
     pub files: Mutex<Files>,
     pub stats: Mutex<Stats>,
+    /// Why the open database broke, if it did. Set after a failed operation, cleared when a database is opened.
+    pub failure: Mutex<Option<Failure>>,
     pub closed: AtomicBool,
 }
 
@@ -111,7 +113,7 @@ impl MainFile {
     /// Commits the transaction. On failure, SQLite gets `SQLITE_IOERR_FSYNC`, `SQLITE_FULL` if the storage quota is
     /// exhausted, or `SQLITE_AUTH` if the server rejects the access token, and rolls back, as on a failing disk.
     fn commit(&mut self) -> Result<(), Broken> {
-        match &mut self.db {
+        let result = match &mut self.db {
             Db::Server(db) => {
                 let server = self.inner.server();
                 db.commit(
@@ -122,11 +124,12 @@ impl MainFile {
             }
             #[cfg(target_arch = "wasm32")]
             Db::Local(db) => db.commit(&mut lock(&self.inner.stats)),
-        }
+        };
+        self.record(result)
     }
 
     fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, Broken> {
-        match &mut self.db {
+        let result = match &mut self.db {
             Db::Server(db) => db.read(
                 &mut lock(&self.inner.server().client),
                 buf,
@@ -135,11 +138,12 @@ impl MainFile {
             ),
             #[cfg(target_arch = "wasm32")]
             Db::Local(db) => db.read(buf, offset, &mut lock(&self.inner.stats)),
-        }
+        };
+        self.record(result)
     }
 
     fn write(&mut self, data: &[u8], offset: u64) -> Result<(), Broken> {
-        match &mut self.db {
+        let result = match &mut self.db {
             Db::Server(db) => db.write(
                 &mut lock(&self.inner.server().client),
                 data,
@@ -148,15 +152,32 @@ impl MainFile {
             ),
             #[cfg(target_arch = "wasm32")]
             Db::Local(db) => db.write(data, offset, &mut lock(&self.inner.stats)),
-        }
+        };
+        self.record(result)
     }
 
     fn truncate(&mut self, size: u64) -> Result<(), Broken> {
-        match &mut self.db {
+        let result = match &mut self.db {
             Db::Server(db) => db.truncate(size),
             #[cfg(target_arch = "wasm32")]
             Db::Local(db) => db.truncate(size),
+        };
+        self.record(result)
+    }
+
+    /// Records why the database broke, if the operation that returned `result` broke it.
+    fn record<T>(&self, result: Result<T, Broken>) -> Result<T, Broken> {
+        if result.is_err() {
+            let broken = match &self.db {
+                Db::Server(db) => db.broken(),
+                #[cfg(target_arch = "wasm32")]
+                Db::Local(db) => db.broken(),
+            };
+            if let Some(broken) = broken {
+                *lock(&self.inner.failure) = Some(failure_of(broken));
+            }
         }
+        result
     }
 
     fn file_size(&self) -> u64 {
@@ -507,7 +528,20 @@ fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Db> {
         Backend::Local(bridge) => Db::Local(open_locally(data, bridge, name, create)?),
     };
     files.database = Some(name.into());
+    *lock(&data.failure) = None;
     Ok(db)
+}
+
+/// The public reason for an internal one.
+fn failure_of(broken: &Broken) -> Failure {
+    match broken {
+        Broken::Fenced => Failure::TakenOver,
+        Broken::Uncertain(_) => Failure::Unreachable,
+        Broken::Denied(_) => Failure::Denied,
+        Broken::Diverged(_) | Broken::Refused(_) => Failure::Rejected,
+        #[cfg(target_arch = "wasm32")]
+        Broken::Full(_) => Failure::Full,
+    }
 }
 
 fn blocks_per_fetch(config: &Config) -> Option<u64> {
@@ -577,4 +611,18 @@ fn open_locally(
         };
         io_error(code, format!("{name}: {refusal}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_reason_has_a_public_failure() {
+        assert_eq!(failure_of(&Broken::Fenced), Failure::TakenOver);
+        assert_eq!(failure_of(&Broken::Uncertain("gone".into())), Failure::Unreachable);
+        assert_eq!(failure_of(&Broken::Denied("token".into())), Failure::Denied);
+        assert_eq!(failure_of(&Broken::Diverged("version".into())), Failure::Rejected);
+        assert_eq!(failure_of(&Broken::Refused("too large".into())), Failure::Rejected);
+    }
 }

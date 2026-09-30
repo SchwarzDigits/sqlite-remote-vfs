@@ -243,6 +243,25 @@ pub struct Stats {
     pub resent_commits: u64,
 }
 
+/// Why the database open on a [`RemoteVfs`] no longer accepts writes. See [`RemoteVfs::failure`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Failure {
+    /// Another instance has taken the database over, with [`Config::takeover`]: on a server by taking its lease,
+    /// locally by taking its lock.
+    TakenOver,
+    /// The server could not be reached within [`Server::reconnect_timeout`], so whether the last commit was stored is
+    /// unknown. Locally: the connection worker did not answer within [`Config::timeout`].
+    Unreachable,
+    /// The server rejected the access token, or the [`TokenSource`] returned none.
+    Denied,
+    /// The server rejected a commit, or after reconnecting it was at another version than this client expected, e.g.
+    /// after a restore. Locally: IndexedDB rejected the commit.
+    Rejected,
+    /// Locally: the browser's storage quota is exhausted.
+    Full,
+}
+
 /// Error returned when registering a VFS or deleting a database fails.
 #[derive(Debug)]
 pub struct Error {
@@ -344,6 +363,7 @@ impl RemoteVfs {
             backend,
             files: Mutex::new(Files::default()),
             stats: Mutex::new(Stats::default()),
+            failure: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
         // SAFETY: `Io`, `Vfs` and their callbacks agree on the VFS version, the file layout and the app data type.
@@ -382,6 +402,16 @@ impl RemoteVfs {
     /// Returns the current counters.
     pub fn stats(&self) -> Stats {
         *lock(&self.inner.stats)
+    }
+
+    /// Why the open database no longer accepts writes, or `None` while it does.
+    ///
+    /// After a failed commit or read, SQLite reports an I/O error, `SQLITE_AUTH` or `SQLITE_FULL`; this tells the
+    /// reason. The database must then be closed and opened again, which resets the value. A failure that a retry can
+    /// overcome, such as a fetch the server answered with an error, does not break the database and is not reported
+    /// here. A takeover is noticed at the next commit or at the next block that is not in memory.
+    pub fn failure(&self) -> Option<Failure> {
+        *lock(&self.inner.failure)
     }
 
     /// Deletes the database `name`: on the server together with its cache, or locally. The database must not be open

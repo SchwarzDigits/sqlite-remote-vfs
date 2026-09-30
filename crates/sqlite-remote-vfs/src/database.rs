@@ -26,9 +26,11 @@ const MAX_CATCH_UP_RANGES: usize = 4096;
 pub(crate) enum Broken {
     /// Another instance has taken over the lease, or locally the lock.
     Fenced,
-    /// The state on the server is unknown to this client: the connection could not be restored, or the server is at
-    /// an unexpected version after reconnecting. Locally: the connection worker did not answer in time.
+    /// The connection could not be restored in time, so the state on the server is unknown to this client. Locally:
+    /// the connection worker did not answer in time.
     Uncertain(String),
+    /// After reconnecting, the server is at a version this client does not expect, e.g. after a restore.
+    Diverged(String),
     /// The server rejected a commit, or a fetch failed. Locally: IndexedDB failed.
     Refused(String),
     /// The server rejected the access token when the client reconnected. SQLite gets `SQLITE_AUTH` for a commit.
@@ -196,7 +198,7 @@ impl Database {
             if !client.is_connected() {
                 let opened = remote.resume_until(client, pages.page_size(), deadline, stats)?;
                 if opened.version != remote.version {
-                    return Err(remote.break_with(Broken::Uncertain(format!(
+                    return Err(remote.break_with(Broken::Diverged(format!(
                         "server is at version {}, this client at {}",
                         opened.version, remote.version
                     ))));
@@ -221,7 +223,7 @@ impl Database {
                         break opened.version;
                     }
                     if opened.version != remote.version {
-                        return Err(remote.break_with(Broken::Uncertain(format!(
+                        return Err(remote.break_with(Broken::Diverged(format!(
                             "server is at version {}, this client at {}",
                             opened.version, remote.version
                         ))));
@@ -252,6 +254,11 @@ impl Database {
         Ok(())
     }
 
+    /// Why the database no longer accepts writes, if it does not.
+    pub fn broken(&self) -> Option<&Broken> {
+        self.remote.broken.as_ref()
+    }
+
     /// Takes the local copy out of the database, so that the next database opened on this VFS can use it. In a browser
     /// the local copy is a handle to the connection worker, which exists once per VFS.
     #[cfg(target_arch = "wasm32")]
@@ -263,8 +270,15 @@ impl Database {
     }
 
     /// Releases the lease. Best effort: if this fails, the lease expires on the server.
+    ///
+    /// A broken database cannot release its lease, and the server would keep it open on this connection and refuse to
+    /// open it again there. The connection is dropped instead; the next request reconnects.
     pub fn close(&self, client: &mut Client) {
-        if self.remote.broken.is_some() || !client.is_connected() {
+        if self.remote.broken.is_some() {
+            client.disconnect();
+            return;
+        }
+        if !client.is_connected() {
             return;
         }
         let _ = client.call(client_frame::Body::CloseDb(pb::CloseDb {

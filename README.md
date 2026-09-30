@@ -40,6 +40,9 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
 - **Open errors.** Opening without `SQLITE_OPEN_CREATE` fails with `SQLITE_CANTOPEN` only if the database does not
   exist, and with `SQLITE_BUSY` if another instance has it open. Other failures, such as an unreachable server, give
   `SQLITE_IOERR`. An application can therefore tell a database that is not stored from one it cannot reach.
+- **Why a database stopped.** After a failed commit or read, `RemoteVfs::failure()` tells why the open database no
+  longer accepts writes: `TakenOver` (another instance took it over), `Unreachable`, `Denied` (access token),
+  `Rejected` or `Full`. Closing and opening the database again resets it.
 - **Cache (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
   databases of one key keep their own caches. Reads are served from it without a round trip. It contains only data
   the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale cache is

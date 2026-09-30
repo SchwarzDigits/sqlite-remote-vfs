@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rusqlite::backup::{Backup, StepResult};
 use rusqlite::{Connection, ErrorCode, OpenFlags};
-use sqlite_remote_vfs::{Config, Load, Memory, RemoteVfs};
+use sqlite_remote_vfs::{Config, Failure, Load, Memory, RemoteVfs};
 use sqlite_wasm_rs as _;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -145,6 +145,8 @@ async fn takeover_fences_the_first_instance() {
         .execute("INSERT INTO t VALUES (1000, x'00')", [])
         .expect_err("the first instance was taken over");
     assert_eq!(err.sqlite_error_code(), Some(ErrorCode::SystemIoFailure), "{err}");
+    assert_eq!(first.failure(), Some(Failure::TakenOver));
+    assert_eq!(second.failure(), None);
     insert(&second_conn, 50, 10, 200);
     drop(second_conn);
     drop(first_conn);

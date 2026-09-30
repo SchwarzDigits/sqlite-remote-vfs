@@ -140,6 +140,11 @@ impl LocalDatabase {
         Ok(())
     }
 
+    /// Why the database no longer accepts writes, if it does not.
+    pub fn broken(&self) -> Option<&Broken> {
+        self.broken.as_ref()
+    }
+
     /// Closes the database and releases its lock.
     pub fn close(&self) {
         self.bridge.close();
