@@ -124,6 +124,12 @@ pub struct Server {
     /// token fails the registration with [`Error::is_access_denied`], and a database operation with `SQLITE_AUTH`.
     pub token: Option<Arc<dyn TokenSource>>,
     /// Identifier of this client instance. Random if `None`.
+    ///
+    /// An instance with the same identifier as the current holder of a database's lease opens it without
+    /// [`Config::takeover`]: the server grants a new lease and fences the old one. A client that sets a stable
+    /// identifier, e.g. per device and account, therefore gets its databases back at once after a restart, instead of
+    /// waiting until its old lease expires. Two instances that run at the same time must never use the same identifier:
+    /// each would take the lease from the other at every open.
     pub instance_id: Option<[u8; 16]>,
     /// Optional cache on this device. It may be incomplete: blocks it does not have are fetched from the server and
     /// then added to it.

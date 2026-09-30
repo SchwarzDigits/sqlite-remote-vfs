@@ -79,7 +79,9 @@ pub struct Hello {
     /// Protocol version of the client. The server rejects a version other than its own with ERROR_CODE_BAD_REQUEST.
     #[prost(uint32, tag = "1")]
     pub protocol_version: u32,
-    /// Random id of the client instance, e.g. one browser tab or worker. 1 to 64 bytes.
+    /// Id of the client instance, e.g. one browser tab or worker. 1 to 64 bytes. Usually random. A client that restarts
+    /// may use the same id again to take back its own lease without takeover, see `Open.takeover`. Two instances that run
+    /// at the same time must not use the same id.
     #[prost(bytes = "vec", tag = "2")]
     pub instance_id: ::prost::alloc::vec::Vec<u8>,
     /// Algorithm and public key of the client's key pair. The client proves possession of the private key with a
@@ -164,7 +166,8 @@ pub struct Open {
     #[prost(bool, tag = "3")]
     pub create_if_missing: bool,
     /// Acquires the lease even if another instance holds one that has not expired. Without it, the open fails with
-    /// ERROR_CODE_LEASE_HELD in that case.
+    /// ERROR_CODE_LEASE_HELD in that case. The instance that holds the lease, identified by `Hello.instance_id`, gets a
+    /// new lease without it: a client that restarted has lost its lease id and cannot resume. Its earlier lease is fenced.
     #[prost(bool, tag = "4")]
     pub takeover: bool,
     /// Set only when reopening after a broken connection. Continues the previous lease instead of acquiring a new one.

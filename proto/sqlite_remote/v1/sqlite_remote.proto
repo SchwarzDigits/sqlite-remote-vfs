@@ -52,7 +52,9 @@ message ServerFrame {
 message Hello {
   // Protocol version of the client. The server rejects a version other than its own with ERROR_CODE_BAD_REQUEST.
   uint32 protocol_version = 1;
-  // Random id of the client instance, e.g. one browser tab or worker. 1 to 64 bytes.
+  // Id of the client instance, e.g. one browser tab or worker. 1 to 64 bytes. Usually random. A client that restarts
+  // may use the same id again to take back its own lease without takeover, see `Open.takeover`. Two instances that run
+  // at the same time must not use the same id.
   bytes instance_id = 2;
   // Algorithm and public key of the client's key pair. The client proves possession of the private key with a
   // `Proof`. The server derives the subject from the public key. The subject determines which databases the
@@ -130,7 +132,8 @@ message Open {
   // ERROR_CODE_NOT_FOUND.
   bool create_if_missing = 3;
   // Acquires the lease even if another instance holds one that has not expired. Without it, the open fails with
-  // ERROR_CODE_LEASE_HELD in that case.
+  // ERROR_CODE_LEASE_HELD in that case. The instance that holds the lease, identified by `Hello.instance_id`, gets a
+  // new lease without it: a client that restarted has lost its lease id and cannot resume. Its earlier lease is fenced.
   bool takeover = 4;
   // Set only when reopening after a broken connection. Continues the previous lease instead of acquiring a new one.
   Resume resume = 5;
