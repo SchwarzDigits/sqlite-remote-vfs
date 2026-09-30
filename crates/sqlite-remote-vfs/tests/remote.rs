@@ -152,6 +152,44 @@ fn takeover_sees_commits_and_fences_holder() {
 }
 
 #[test]
+fn same_instance_takes_its_lease_back_without_takeover() {
+    let Some(url) = server_url() else { return };
+    let subject = TestSigner::fresh();
+    let mut instance = [0u8; 16];
+    getrandom::fill(&mut instance).unwrap();
+    let with_instance = || {
+        let mut server = Server::new(&url, subject.clone());
+        server.instance_id = Some(instance);
+        Config::new(Store::Server(server))
+    };
+
+    // The first instance stops without closing, as a reloaded browser page does: its lease is still valid.
+    let first = register(with_instance());
+    let first_conn = open(&first, "db", &KEY).unwrap();
+    first_conn.execute_batch(CREATE).unwrap();
+    insert_rows(&first_conn, 0, 5, 100);
+
+    // Another instance still needs a takeover.
+    let other = register(Config::server(&url, subject.clone()));
+    let err = open(&other, "db", &KEY).unwrap_err();
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::DatabaseBusy), "{err}");
+
+    // The restarted instance, with the same instance id, opens at once.
+    let restarted = register(with_instance());
+    let conn = open(&restarted, "db", &KEY).expect("the holder's own instance needs no takeover");
+    assert_eq!(count(&conn), 5);
+    insert_rows(&conn, 5, 5, 100);
+
+    // Its earlier lease is fenced.
+    let err = first_conn
+        .execute("INSERT INTO t (id, payload) VALUES (1000, x'00')", [])
+        .unwrap_err();
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::SystemIoFailure), "{err}");
+    assert_eq!(first.failure(), Some(Failure::TakenOver));
+    assert_eq!(count(&conn), 10);
+}
+
+#[test]
 fn held_lease_blocks_second_open() {
     let Some(url) = server_url() else { return };
     let subject = TestSigner::fresh();
