@@ -33,7 +33,18 @@ pub(crate) trait Transport: AcrossThreads {
     /// connection itself: a new worker cannot be started during a call from SQLite, because that needs a running
     /// event loop.
     fn reopen(&mut self) -> Result<(), String>;
+
+    /// Whether the server accepted a connection since the last call that returned true. Does not block: the first
+    /// call starts trying to connect in the background, with growing pauses, and returns false. A database that broke
+    /// because the server could not be reached tries to recover only when this returns true.
+    fn reachable(&mut self) -> bool;
 }
+
+/// Pauses between background connection attempts after the server became unreachable: the first, and the longest.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+const PROBE_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+const PROBE_MAX_PAUSE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Opens a connection. The protocol login (`Hello`, `Proof`) is done by the client.
 pub(crate) fn dial(config: &ClientConfig) -> Result<Box<dyn Transport>, String> {
@@ -47,6 +58,7 @@ pub(crate) use imp::{LocalBridge, Refusal, start, start_local};
 mod imp {
     use std::io::{self, Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, OnceLock};
 
     use rustls::pki_types::{CertificateDer, ServerName};
@@ -54,13 +66,15 @@ mod imp {
     use tungstenite::client::IntoClientRequest;
     use tungstenite::{Message, WebSocket};
 
-    use super::Transport;
+    use super::{PROBE_MAX_PAUSE, PROBE_PAUSE, Transport};
     use crate::client::ClientConfig;
 
     /// WebSocket over a blocking socket. Reads and writes time out after the configured timeout.
     struct Socket {
         socket: WebSocket<Stream>,
         config: ClientConfig,
+        /// Set while a background thread tries to connect. It becomes true when a connection succeeded.
+        probe: Option<Arc<AtomicBool>>,
     }
 
     /// Byte stream under the WebSocket: plain TCP for `ws://`, TLS over TCP for `wss://`.
@@ -116,12 +130,44 @@ mod imp {
             self.socket = open(&self.config)?;
             Ok(())
         }
+
+        fn reachable(&mut self) -> bool {
+            match &self.probe {
+                Some(connected) if connected.load(Ordering::Acquire) => {
+                    self.probe = None;
+                    true
+                }
+                Some(_) => false,
+                None => {
+                    let connected = Arc::new(AtomicBool::new(false));
+                    let watched = Arc::downgrade(&connected);
+                    let config = self.config.clone();
+                    // The thread ends when a connection succeeds or when this socket is dropped.
+                    std::thread::spawn(move || {
+                        let mut pause = PROBE_PAUSE;
+                        while watched.strong_count() > 0 {
+                            if open(&config).is_ok() {
+                                if let Some(connected) = watched.upgrade() {
+                                    connected.store(true, Ordering::Release);
+                                }
+                                return;
+                            }
+                            std::thread::sleep(pause);
+                            pause = (pause * 2).min(PROBE_MAX_PAUSE);
+                        }
+                    });
+                    self.probe = Some(connected);
+                    false
+                }
+            }
+        }
     }
 
     pub(super) fn dial(config: &ClientConfig) -> Result<Box<dyn Transport>, String> {
         Ok(Box::new(Socket {
             socket: open(config)?,
             config: config.clone(),
+            probe: None,
         }))
     }
 
@@ -246,6 +292,7 @@ mod imp {
     const REQUEST: u32 = 4;
     const OP: u32 = 5;
     const REQUEST_LENGTH: u32 = 6;
+    const REACHABLE: u32 = 7;
 
     const STATE_OPEN: i32 = 1;
     const KIND_FRAME: i32 = 1;
@@ -266,6 +313,7 @@ mod imp {
     const OP_COPY_FORGET: i32 = 9;
     const OP_COPY_SELECT: i32 = 10;
     const OP_COPY_FLUSH: i32 = 16;
+    const OP_PROBE: i32 = 17;
     const OP_LOCAL_OPEN: i32 = 11;
     const OP_LOCAL_READ: i32 = 12;
     const OP_LOCAL_COMMIT: i32 = 13;
@@ -292,6 +340,8 @@ mod imp {
         timeout: std::time::Duration,
         /// Last value of the `ANSWER` counter that this side has consumed.
         seen: Cell<i32>,
+        /// Whether the connection worker is trying to connect in the background, after `OP_PROBE`.
+        probing: Cell<bool>,
     }
 
     /// Transport over the bridge.
@@ -515,6 +565,22 @@ mod imp {
         fn reopen(&mut self) -> Result<(), String> {
             self.0.ask(OP_REOPEN, 0)?;
             self.0.wait_until_open()
+        }
+
+        fn reachable(&mut self) -> bool {
+            let shared = &self.0;
+            if shared.probing.get() {
+                if load(&shared.control, REACHABLE) != Ok(1) {
+                    return false;
+                }
+                shared.probing.set(false);
+                return true;
+            }
+            // The worker answers at once and connects in the background. It sets `REACHABLE` when it succeeds.
+            if shared.ask(OP_PROBE, 0).is_ok() {
+                shared.probing.set(true);
+            }
+            false
         }
     }
 
@@ -805,6 +871,7 @@ mod imp {
             answer,
             timeout,
             seen: Cell::new(0),
+            probing: Cell::new(false),
         }))
     }
 

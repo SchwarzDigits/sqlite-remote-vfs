@@ -187,6 +187,15 @@ impl Client {
         self.connected = false;
     }
 
+    /// Whether the server accepted a connection since the last call that returned true. Does not block. See
+    /// `Transport::reachable`.
+    pub fn reachable(&mut self) -> bool {
+        match &mut self.socket {
+            Some(socket) => socket.reachable(),
+            None => true,
+        }
+    }
+
     /// Opens a new connection and logs in. Databases opened on the old connection must be resumed.
     pub fn reconnect(&mut self) -> Result<(), ClientError> {
         self.open_socket()?;

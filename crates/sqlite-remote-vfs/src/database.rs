@@ -20,7 +20,8 @@ const RECONNECT_PAUSE: Duration = Duration::from_millis(200);
 /// that request. The server rejects requests with more ranges.
 const MAX_CATCH_UP_RANGES: usize = 4096;
 
-/// Reason why a database no longer accepts writes. It has to be closed and opened again.
+/// Reason why a database can no longer be used. It has to be closed and opened again, except after `Uncertain` on a
+/// server, which [`Database::heal`] can undo.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Broken {
     /// Another instance has taken over the lease, or locally the lock.
@@ -52,6 +53,8 @@ struct Remote {
     lease_id: Vec<u8>,
     lease_epoch: u64,
     last_commit_id: Vec<u8>,
+    /// commit_id of a commit whose outcome is unknown because the connection broke before it was acknowledged.
+    pending_commit: Option<Vec<u8>>,
     /// Optional local copy. It is disabled for the rest of the session after its first error. Such errors are not
     /// reported to SQLite, because the server has all blocks.
     local: LocalCopy,
@@ -108,6 +111,7 @@ impl Database {
             lease_id: opened.lease_id,
             lease_epoch: opened.lease_epoch,
             last_commit_id: opened.last_commit_id,
+            pending_commit: None,
             local: match options.local {
                 Some(store) => LocalCopy::Ready(store),
                 None => LocalCopy::None,
@@ -115,17 +119,55 @@ impl Database {
             broken: None,
         };
 
-        let from_copy = remote.take_copy(client, &mut pages, stats)?;
-        if !pages.on_demand() && pages.page_count() > 0 && !from_copy {
-            let count = pages.page_count();
-            remote.load(client, &mut pages, 0, count, stats)?;
-            // Write all blocks to the local copy, so that it starts at the same version.
-            remote.write_copy(&pages, &pages.indexes(), stats);
-        }
-        // A preloaded database can exceed the memory limit right away.
-        pages.make_room(0, stats);
-        stats.held_blocks = pages.held();
+        remote.fill(client, &mut pages, stats)?;
         Ok(Database { pages, remote })
+    }
+
+    /// Whether the database broke because the server could not be reached, so that [`Database::heal`] may make it
+    /// usable again.
+    pub fn is_unreachable(&self) -> bool {
+        matches!(self.remote.broken, Some(Broken::Uncertain(_)))
+    }
+
+    /// Makes a database usable again that broke because the server could not be reached. Reconnects, resumes the
+    /// lease, finds out whether the pending commit was applied, and loads the blocks as of the server's current
+    /// version, as when opening. The blocks in memory are discarded, including those of a commit that was not
+    /// applied.
+    ///
+    /// SQLite has rolled back and dropped its page cache after the error that broke the database. With a journal on
+    /// this VFS, it finds the journal of a failed commit at its next access and rolls that commit back also if the
+    /// server had applied it. Its SQLite call then reports a failed commit consistently.
+    ///
+    /// Fails, and the database stays broken, if the server is still unreachable, the lease was taken over, the token
+    /// is rejected, or the server is at a version that neither includes nor excludes exactly the pending commit.
+    pub fn heal(&mut self, client: &mut Client, stats: &mut Stats) -> Result<(), Broken> {
+        let remote = &mut self.remote;
+        let opened = remote
+            .resume(client, self.pages.page_size(), stats)
+            .map_err(|err| remote.break_on(err))?;
+        let applied = opened.version == remote.version + 1
+            && remote.pending_commit.as_deref() == Some(opened.last_commit_id.as_slice());
+        if opened.version != remote.version && !applied {
+            return Err(remote.break_with(Broken::Diverged(format!(
+                "server is at version {}, this client at {}",
+                opened.version, remote.version
+            ))));
+        }
+        if applied {
+            stats.recovered_commits += 1;
+        }
+        remote.version = opened.version;
+        remote.last_commit_id = opened.last_commit_id;
+        remote.pending_commit = None;
+
+        let mut pages = self.pages.emptied(opened.page_count);
+        remote
+            .fill(client, &mut pages, stats)
+            .map_err(|err| remote.break_on(err))?;
+        self.pages = pages;
+        remote.broken = None;
+        stats.healed += 1;
+        Ok(())
     }
 
     pub fn file_size(&self) -> u64 {
@@ -134,6 +176,8 @@ impl Database {
 
     /// Reads `buf.len()` bytes at `offset`. Returns false if the read extends past the end of the file. The part past
     /// the end is zero-filled, as SQLite expects.
+    ///
+    /// Fails if the database is broken: the blocks in memory may hold a commit that failed.
     pub fn read(
         &mut self,
         client: &mut Client,
@@ -141,6 +185,9 @@ impl Database {
         offset: u64,
         stats: &mut Stats,
     ) -> Result<bool, Broken> {
+        if let Some(broken) = &self.remote.broken {
+            return Err(broken.clone());
+        }
         let mut fetch = Fetch {
             remote: &mut self.remote,
             client,
@@ -190,6 +237,9 @@ impl Database {
         let mut commit_id = [0u8; COMMIT_ID_BYTES];
         getrandom::fill(&mut commit_id).expect("OS randomness");
         let parts = remote.parts(pages, &commit_id, client.limits().max_frame_bytes as usize);
+        // Stays set if the commit ends with the server unreachable, so that healing can find out whether it was
+        // applied.
+        remote.pending_commit = Some(commit_id.to_vec());
         let started = Moment::now();
         let deadline = started.plus(reconnect_timeout);
 
@@ -244,6 +294,7 @@ impl Database {
 
         remote.version = version;
         remote.last_commit_id = commit_id.to_vec();
+        remote.pending_commit = None;
         // The commit is durable on the server. Now write the blocks to the local copy.
         let written = pages.committed();
         remote.write_copy(pages, &written, stats);
@@ -321,6 +372,22 @@ impl Source for Fetch<'_> {
 }
 
 impl Remote {
+    /// Loads the blocks after opening: with `Load::Preload` all of them, from the local copy if it is current and
+    /// complete, otherwise from the server. With `Load::OnDemand`, only checks the local copy.
+    fn fill(&mut self, client: &mut Client, pages: &mut Pages, stats: &mut Stats) -> Result<(), ClientError> {
+        let from_copy = self.take_copy(client, pages, stats)?;
+        if !pages.on_demand() && pages.page_count() > 0 && !from_copy {
+            let count = pages.page_count();
+            self.load(client, pages, 0, count, stats)?;
+            // Write all blocks to the local copy, so that it starts at the same version.
+            self.write_copy(pages, &pages.indexes(), stats);
+        }
+        // A preloaded database can exceed the memory limit right away.
+        pages.make_room(0, stats);
+        stats.held_blocks = pages.held();
+        Ok(())
+    }
+
     /// Checks whether the local copy can be used. A copy that is behind is caught up if possible, otherwise it is
     /// cleared. With `Load::Preload`, loads the database from the copy. Returns true if all blocks were loaded from
     /// it.
@@ -654,6 +721,20 @@ impl Remote {
             server_frame::Body::Opened(opened) => Ok(opened),
             other => Err(ClientError::Protocol(format!("expected Opened, got {other:?}"))),
         }
+    }
+
+    /// Breaks the database after a failed attempt to heal it. A lost connection and a transient server error leave
+    /// it healable.
+    fn break_on(&mut self, err: ClientError) -> Broken {
+        let broken = match err {
+            err if err.is_fenced() => Broken::Fenced,
+            err if err.is_access_denied() => Broken::Denied(err.to_string()),
+            ClientError::Server(e) if !matches!(e.code(), pb::ErrorCode::Internal | pb::ErrorCode::RateLimited) => {
+                Broken::Refused(format!("{}: {}", e.code().as_str_name(), e.detail))
+            }
+            err => Broken::Uncertain(format!("no connection to the server: {err}")),
+        };
+        self.break_with(broken)
     }
 
     fn break_with(&mut self, broken: Broken) -> Broken {

@@ -6,6 +6,10 @@
 //! the sync fails and SQLite rolls the transaction back, as on a failing disk. A commit that returned successfully is
 //! stored on the server.
 //!
+//! If the server cannot be reached, the database fails with [`Failure::Unreachable`] and heals by itself once the
+//! server is back, on the same SQLite connection. Use a journal on the VFS, i.e. journal mode `DELETE` (SQLite's
+//! default), `TRUNCATE` or `PERSIST`, so that a commit that failed is also rolled back if it reached the server.
+//!
 //! The VFS does not encrypt. Encryption above it keeps plaintext away from the server: with SQLite3 Multiple Ciphers,
 //! open databases through [`RemoteVfs::encrypted_name`] (`multipleciphers-<name>`); with SQLCipher, through
 //! [`RemoteVfs::name`]. In both cases the key is set with `PRAGMA key`.
@@ -134,7 +138,8 @@ pub struct Server {
     /// Optional cache on this device. It may be incomplete: blocks it does not have are fetched from the server and
     /// then added to it.
     pub cache: Cache,
-    /// How long a commit tries to reconnect before it fails.
+    /// How long a commit tries to reconnect before it fails. After that the database fails with
+    /// [`Failure::Unreachable`] and heals once the server is back, so a short value is enough.
     pub reconnect_timeout: Duration,
     /// Record the block ranges of every fetch, readable with [`RemoteVfs::fetch_trace`]. Useful for analysing the
     /// round trips of a query. The list grows for the lifetime of the VFS.
@@ -247,9 +252,11 @@ pub struct Stats {
     pub recovered_commits: u64,
     /// Commits that had not reached the server when the connection broke and were sent again.
     pub resent_commits: u64,
+    /// Times the database became usable again after [`Failure::Unreachable`].
+    pub healed: u64,
 }
 
-/// Why the database open on a [`RemoteVfs`] no longer accepts writes. See [`RemoteVfs::failure`].
+/// Why the database open on a [`RemoteVfs`] can no longer be used. See [`RemoteVfs::failure`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Failure {
@@ -258,6 +265,17 @@ pub enum Failure {
     TakenOver,
     /// The server could not be reached within [`Server::reconnect_timeout`], so whether the last commit was stored is
     /// unknown. Locally: the connection worker did not answer within [`Config::timeout`].
+    ///
+    /// On a server, the database heals by itself. Meanwhile every access fails at once. In the background the VFS
+    /// tries to connect, with pauses growing up to 10 s. Once the server has accepted a connection, the next access
+    /// resumes the lease, reloads the database as of the server's version and succeeds, and this value is `None`
+    /// again. SQLite rolls a failed commit back at that access if the journal is on the VFS (journal mode `DELETE`,
+    /// `TRUNCATE` or `PERSIST`), also if the commit had reached the server. With journal mode `MEMORY` or `OFF` the
+    /// database stays at the server's version, with or without that commit.
+    ///
+    /// Healing fails, and the database then fails for another reason, if another instance took it over meanwhile
+    /// ([`Failure::TakenOver`]), the access token is rejected ([`Failure::Denied`]), or the server is at an
+    /// unexpected version ([`Failure::Rejected`]).
     Unreachable,
     /// The server rejected the access token, or the [`TokenSource`] returned none.
     Denied,
@@ -410,12 +428,14 @@ impl RemoteVfs {
         *lock(&self.inner.stats)
     }
 
-    /// Why the open database no longer accepts writes, or `None` while it does.
+    /// Why the open database can no longer be used, or `None` while it can.
     ///
     /// After a failed commit or read, SQLite reports an I/O error, `SQLITE_AUTH` or `SQLITE_FULL`; this tells the
-    /// reason. The database must then be closed and opened again, which resets the value. A failure that a retry can
-    /// overcome, such as a fetch the server answered with an error, does not break the database and is not reported
-    /// here. A takeover is noticed at the next commit or at the next block that is not in memory.
+    /// reason. Until then every access to the database fails. After [`Failure::Unreachable`] the database heals by
+    /// itself once the server is back, and the value returns to `None`. After any other failure the database must be
+    /// closed and opened again, which resets the value. A failure that a retry can overcome, such as a fetch the
+    /// server answered with an error, does not break the database and is not reported here. A takeover is noticed at
+    /// the next commit or at the next block that is not in memory.
     pub fn failure(&self) -> Option<Failure> {
         *lock(&self.inner.failure)
     }

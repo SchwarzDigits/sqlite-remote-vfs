@@ -113,6 +113,7 @@ impl MainFile {
     /// Commits the transaction. On failure, SQLite gets `SQLITE_IOERR_FSYNC`, `SQLITE_FULL` if the storage quota is
     /// exhausted, or `SQLITE_AUTH` if the server rejects the access token, and rolls back, as on a failing disk.
     fn commit(&mut self) -> Result<(), Broken> {
+        self.heal();
         let result = match &mut self.db {
             Db::Server(db) => {
                 let server = self.inner.server();
@@ -129,6 +130,7 @@ impl MainFile {
     }
 
     fn read(&mut self, buf: &mut [u8], offset: u64) -> Result<bool, Broken> {
+        self.heal();
         let result = match &mut self.db {
             Db::Server(db) => db.read(
                 &mut lock(&self.inner.server().client),
@@ -143,6 +145,7 @@ impl MainFile {
     }
 
     fn write(&mut self, data: &[u8], offset: u64) -> Result<(), Broken> {
+        self.heal();
         let result = match &mut self.db {
             Db::Server(db) => db.write(
                 &mut lock(&self.inner.server().client),
@@ -157,12 +160,31 @@ impl MainFile {
     }
 
     fn truncate(&mut self, size: u64) -> Result<(), Broken> {
+        self.heal();
         let result = match &mut self.db {
             Db::Server(db) => db.truncate(size),
             #[cfg(target_arch = "wasm32")]
             Db::Local(db) => db.truncate(size),
         };
         self.record(result)
+    }
+
+    /// Makes the database usable again if it broke because the server could not be reached, and the server has
+    /// accepted a connection since. Otherwise leaves it broken, and the operation fails at once. Called before every
+    /// operation on the database file, so that the first access after the server is back succeeds.
+    fn heal(&mut self) {
+        match &mut self.db {
+            Db::Server(db) if db.is_unreachable() => {
+                let mut client = lock(&self.inner.server().client);
+                if !client.reachable() {
+                    return;
+                }
+                let healed = db.heal(&mut client, &mut lock(&self.inner.stats));
+                drop(client);
+                *lock(&self.inner.failure) = healed.err().as_ref().map(failure_of);
+            }
+            _ => {}
+        }
     }
 
     /// Records why the database broke, if the operation that returned `result` broke it.

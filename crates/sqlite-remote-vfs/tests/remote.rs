@@ -898,15 +898,185 @@ fn unreachable_server_is_an_io_error_not_a_missing_database() {
     assert_eq!(err.sqlite_error_code(), Some(ErrorCode::SystemIoFailure), "{err}");
 }
 
-/// TCP relay to the server that can be stopped, to make the server unreachable.
+/// Opens a database with the given journal mode. `open` uses `MEMORY`; SQLite's default is `DELETE`, with the journal
+/// as a file on the VFS.
+fn open_with_journal(vfs: &RemoteVfs, db: &str, key: &[u8; 32], journal_mode: &str) -> Connection {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags_and_vfs(db, flags, vfs.encrypted_name().as_str()).unwrap();
+    conn.pragma_update(None, "key", raw_key(key)).unwrap();
+    let mode: String = conn
+        .query_row(&format!("PRAGMA journal_mode = {journal_mode}"), [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, journal_mode);
+    conn
+}
+
+/// A server through `relay` that gives up reconnecting after half a second.
+fn behind(relay: &Relay, subject: &Arc<dyn Signer>) -> Config {
+    let mut server = Server::new(relay.url(), subject.clone());
+    server.reconnect_timeout = std::time::Duration::from_millis(500);
+    Config::new(Store::Server(server))
+}
+
+/// Reads until the read succeeds or the database no longer fails as unreachable, for at most 15 seconds. The read is
+/// the check an application makes before using a database that failed as unreachable.
+fn access_until_healed(vfs: &RemoteVfs, conn: &Connection) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let read = conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0));
+        if read.is_ok() || vfs.failure() != Some(Failure::Unreachable) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("still unreachable after 15 s");
+}
+
+/// Commits 10 rows, loses the server during the next commit, and brings it back. Returns the row count after the
+/// database healed, on the same connection.
+fn outage_during_commit(url: &str, journal_mode: &str) -> i64 {
+    let proxy = Relay::start(url);
+    let subject = TestSigner::fresh();
+    let vfs = register(behind(&proxy, &subject));
+    let conn = open_with_journal(&vfs, "db", &KEY, journal_mode);
+    conn.execute_batch(CREATE).unwrap();
+    insert_rows(&conn, 0, 10, 100);
+
+    proxy.stop();
+    conn.execute("INSERT INTO t (id, payload) VALUES (10, x'00')", [])
+        .expect_err("the server is gone");
+    assert_eq!(vfs.failure(), Some(Failure::Unreachable));
+    // While the server is gone, accesses fail at once instead of waiting for it.
+    let started = std::time::Instant::now();
+    for _ in 0..3 {
+        let read = conn.query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0));
+        assert!(read.is_err(), "{read:?}");
+    }
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(vfs.failure(), Some(Failure::Unreachable));
+
+    proxy.resume();
+    access_until_healed(&vfs, &conn);
+    assert_eq!(vfs.failure(), None);
+    assert_eq!(vfs.stats().healed, 1);
+    let rows = count(&conn);
+    insert_rows(&conn, 100, 5, 100);
+    assert_eq!(integrity(&conn), "ok");
+    drop(conn);
+
+    let reader = register(Config::server(url, subject.clone()));
+    let conn = open(&reader, "db", &KEY).unwrap();
+    assert_eq!(count(&conn), rows + 5);
+    rows
+}
+
+#[test]
+fn unreachable_database_heals_on_the_same_connection() {
+    let Some(url) = server_url() else { return };
+    assert_eq!(outage_during_commit(&url, "delete"), 10);
+}
+
+#[test]
+fn unreachable_database_heals_with_the_journal_in_memory() {
+    let Some(url) = server_url() else { return };
+    assert_eq!(outage_during_commit(&url, "memory"), 10);
+}
+
+/// Commits 10 rows, then commits one more row while the server's answers are lost, so that the server applies it
+/// but the client cannot tell. Returns the row count after the database healed, on the same connection.
+fn applied_commit_lost_in_outage(url: &str, journal_mode: &str) -> i64 {
+    let proxy = Relay::start(url);
+    let subject = TestSigner::fresh();
+    let mut config = behind(&proxy, &subject);
+    config.timeout = std::time::Duration::from_secs(1);
+    let vfs = register(config);
+    let conn = open_with_journal(&vfs, "db", &KEY, journal_mode);
+    conn.execute_batch(CREATE).unwrap();
+    insert_rows(&conn, 0, 10, 100);
+
+    proxy.mute(true);
+    conn.execute("INSERT INTO t (id, payload) VALUES (10, x'00')", [])
+        .expect_err("the acknowledgement is lost");
+    assert_eq!(vfs.failure(), Some(Failure::Unreachable));
+
+    proxy.stop();
+    proxy.mute(false);
+    proxy.resume();
+    access_until_healed(&vfs, &conn);
+    assert_eq!(vfs.failure(), None);
+    let stats = vfs.stats();
+    assert_eq!((stats.healed, stats.recovered_commits), (1, 1), "{stats:?}");
+    assert_eq!(integrity(&conn), "ok");
+    let rows = count(&conn);
+    drop(conn);
+
+    let reader = register(Config::server(url, subject.clone()));
+    let conn = open(&reader, "db", &KEY).unwrap();
+    assert_eq!(count(&conn), rows);
+    rows
+}
+
+#[test]
+fn commit_that_reached_the_server_is_rolled_back_after_healing() {
+    let Some(url) = server_url() else { return };
+    // SQLite finds the journal of the failed commit and rolls it back, although the server had applied it. The
+    // application saw the commit fail, and the database agrees.
+    assert_eq!(applied_commit_lost_in_outage(&url, "delete"), 10);
+}
+
+#[test]
+fn commit_that_reached_the_server_stays_with_the_journal_in_memory() {
+    let Some(url) = server_url() else { return };
+    // Without a journal on the VFS nothing rolls the commit back: the database is at the server's version, which
+    // includes it.
+    assert_eq!(applied_commit_lost_in_outage(&url, "memory"), 11);
+}
+
+#[test]
+fn takeover_during_outage_is_reported_when_the_server_is_back() {
+    let Some(url) = server_url() else { return };
+    let proxy = Relay::start(&url);
+    let subject = TestSigner::fresh();
+    let vfs = register(behind(&proxy, &subject));
+    let conn = open_with_journal(&vfs, "db", &KEY, "delete");
+    conn.execute_batch(CREATE).unwrap();
+    insert_rows(&conn, 0, 10, 100);
+
+    proxy.stop();
+    conn.execute("INSERT INTO t (id, payload) VALUES (10, x'00')", [])
+        .expect_err("the server is gone");
+    let mut config = Config::server(&url, subject.clone());
+    config.takeover = true;
+    let other = register(config);
+    let taken = open(&other, "db", &KEY).unwrap();
+    insert_rows(&taken, 20, 1, 100);
+
+    proxy.resume();
+    access_until_healed(&vfs, &conn);
+    assert_eq!(vfs.failure(), Some(Failure::TakenOver));
+    assert!(
+        conn.query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))
+            .is_err()
+    );
+    assert_eq!(count(&taken), 11);
+}
+
+/// TCP relay to the server that can be stopped and resumed, to make the server unreachable for a while, and muted,
+/// to lose the server's answers.
 struct Relay {
     url: String,
     stopped: Arc<std::sync::atomic::AtomicBool>,
+    muted: Arc<std::sync::atomic::AtomicBool>,
     streams: Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>,
 }
 
 impl Relay {
     fn start(server_url: &str) -> Relay {
+        use std::io::{Read, Write};
         use std::net::{TcpListener, TcpStream};
 
         let authority = server_url
@@ -919,8 +1089,9 @@ impl Relay {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("ws://{}{path}", listener.local_addr().unwrap());
         let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streams = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let (stop, open) = (stopped.clone(), streams.clone());
+        let (stop, mute, open) = (stopped.clone(), muted.clone(), streams.clone());
         std::thread::spawn(move || {
             for client in listener.incoming() {
                 let Ok(client) = client else { continue };
@@ -932,18 +1103,37 @@ impl Relay {
                 open.lock()
                     .unwrap()
                     .extend([client.try_clone().unwrap(), upstream.try_clone().unwrap()]);
-                for (mut from, mut to) in [
-                    (client.try_clone().unwrap(), upstream.try_clone().unwrap()),
-                    (upstream, client),
+                // Client to server: always forwarded. Server to client: dropped while muted.
+                for (mut from, mut to, answers) in [
+                    (client.try_clone().unwrap(), upstream.try_clone().unwrap(), false),
+                    (upstream, client, true),
                 ] {
+                    let mute = mute.clone();
                     std::thread::spawn(move || {
-                        let _ = std::io::copy(&mut from, &mut to);
+                        let mut buf = [0u8; 16 * 1024];
+                        loop {
+                            let n = match from.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => n,
+                            };
+                            if answers && mute.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            if to.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
                         let _ = to.shutdown(std::net::Shutdown::Both);
                     });
                 }
             }
         });
-        Relay { url, stopped, streams }
+        Relay {
+            url,
+            stopped,
+            muted,
+            streams,
+        }
     }
 
     fn url(&self) -> String {
@@ -956,6 +1146,16 @@ impl Relay {
         for stream in self.streams.lock().unwrap().drain(..) {
             let _ = stream.shutdown(std::net::Shutdown::Both);
         }
+    }
+
+    /// Relays new connections again after `stop`.
+    fn resume(&self) {
+        self.stopped.store(false, Ordering::Relaxed);
+    }
+
+    /// Drops everything the server sends, or relays it again.
+    fn mute(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
     }
 }
 

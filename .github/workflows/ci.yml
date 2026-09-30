@@ -190,6 +190,16 @@ jobs:
           token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
           token-issuer: sqlite-remote-vfs-tests
           token-leeway: 1s
+      # Relay in front of the first server, which heal.rs stops and resumes through the control port.
+      - name: Start relay
+        run: |
+          nohup python3 relay.py 127.0.0.1:18090 18092 18093 > "$RUNNER_TEMP/relay.log" 2>&1 &
+          for _ in $(seq 50); do
+            curl -sf http://127.0.0.1:18093/resume > /dev/null && break
+            sleep 0.2
+          done
+          echo "SQLITE_REMOTE_TEST_RELAY_URL=ws://127.0.0.1:18092/v1/ws" >> "$GITHUB_ENV"
+          echo "SQLITE_REMOTE_TEST_RELAY_CONTROL=http://127.0.0.1:18093" >> "$GITHUB_ENV"
       # The runner image has llvm-ar only under a versioned name.
       - name: Find llvm-ar
         run: |
@@ -253,6 +263,16 @@ jobs:
           token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
           token-issuer: sqlite-remote-vfs-tests
           token-leeway: 1s
+      # Relay in front of the first server, which heal.rs stops and resumes through the control port.
+      - name: Start relay
+        run: |
+          nohup python3 relay.py 127.0.0.1:18090 18092 18093 > "$RUNNER_TEMP/relay.log" 2>&1 &
+          for _ in $(seq 50); do
+            curl -sf http://127.0.0.1:18093/resume > /dev/null && break
+            sleep 0.2
+          done
+          echo "SQLITE_REMOTE_TEST_RELAY_URL=ws://127.0.0.1:18092/v1/ws" >> "$GITHUB_ENV"
+          echo "SQLITE_REMOTE_TEST_RELAY_CONTROL=http://127.0.0.1:18093" >> "$GITHUB_ENV"
       # Safari only accepts WebDriver sessions after remote automation is enabled. It has no headless mode.
       - name: Enable Safari's WebDriver
         run: sudo safaridriver --enable

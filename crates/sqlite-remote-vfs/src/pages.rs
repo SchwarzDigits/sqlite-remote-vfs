@@ -57,6 +57,11 @@ impl Pages {
         }
     }
 
+    /// Empty blocks of the same page size and settings, for a database of `page_count` blocks.
+    pub fn emptied(&self, page_count: u64) -> Self {
+        Pages::new(self.page_size, page_count, self.blocks_per_fetch, self.cap)
+    }
+
     pub fn page_size(&self) -> usize {
         self.page_size
     }

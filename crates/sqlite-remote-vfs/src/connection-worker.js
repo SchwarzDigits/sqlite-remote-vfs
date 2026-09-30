@@ -23,6 +23,7 @@ const LENGTH = 3; // number of answer bytes in the answer region
 const REQUEST = 4; // set to 1 by the SQLite worker when a request is ready; cleared by this worker
 const OP = 5; // requested operation (OP_*)
 const REQUEST_LENGTH = 6; // number of request bytes in the request region
+const REACHABLE = 7; // set to 1 when a background connection after OP_PROBE succeeded
 
 const STATE_OPEN = 1;
 const STATE_FAILED = 2;
@@ -46,6 +47,12 @@ const OP_COPY_CLEAR = 8;
 const OP_COPY_FORGET = 9;
 const OP_COPY_SELECT = 10;
 const OP_COPY_FLUSH = 16;
+// Tries to connect in the background until the server accepts a connection, then sets REACHABLE. A database that
+// broke because the server could not be reached recovers only then, so its SQLite calls never wait for an
+// unreachable server.
+const OP_PROBE = 17;
+const PROBE_PAUSE_MS = 500;
+const PROBE_MAX_PAUSE_MS = 10000;
 // Local database operations, for a VFS without a server.
 const OP_LOCAL_OPEN = 11;
 const OP_LOCAL_READ = 12;
@@ -61,6 +68,7 @@ let answer = null;
 let url = null;
 let socket = null;
 let closed = false;
+let probing = false;
 
 // Local copy: one IndexedDB database per database name, named copyPrefix + "/" + name, with a "blocks" store keyed
 // by block index and a "head" store. Both are written in one transaction, so the head always matches the blocks.
@@ -158,6 +166,29 @@ function connect() {
   socket.onclose = (event) => fail("connection closed: " + event.code + " " + event.reason);
 }
 
+// Opens a separate connection and closes it again once it is open. Retries with growing pauses until then.
+function probe(pause) {
+  if (closed) {
+    probing = false;
+    return;
+  }
+  let attempt;
+  try {
+    attempt = new WebSocket(url);
+  } catch (error) {
+    setTimeout(() => probe(Math.min(pause * 2, PROBE_MAX_PAUSE_MS)), pause);
+    return;
+  }
+  attempt.onopen = () => {
+    attempt.onclose = null;
+    attempt.close();
+    probing = false;
+    Atomics.store(control, REACHABLE, 1);
+  };
+  // A failed connection is always followed by a close event.
+  attempt.onclose = () => setTimeout(() => probe(Math.min(pause * 2, PROBE_MAX_PAUSE_MS)), pause);
+}
+
 function drop() {
   if (socket !== null) {
     socket.onclose = null;
@@ -193,6 +224,15 @@ function work() {
     case OP_REOPEN:
       drop();
       connect();
+      put(KIND_DONE, null);
+      break;
+
+    case OP_PROBE:
+      if (!probing) {
+        probing = true;
+        Atomics.store(control, REACHABLE, 0);
+        probe(PROBE_PAUSE_MS);
+      }
       put(KIND_DONE, null);
       break;
 

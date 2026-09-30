@@ -534,6 +534,7 @@ fn delta(before: Stats, after: Stats) -> Stats {
         held_blocks: after.held_blocks,
         recovered_commits: after.recovered_commits - before.recovered_commits,
         resent_commits: after.resent_commits - before.resent_commits,
+        healed: after.healed - before.healed,
     }
 }
 

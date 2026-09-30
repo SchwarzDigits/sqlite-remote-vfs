@@ -40,9 +40,15 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
 - **Open errors.** Opening without `SQLITE_OPEN_CREATE` fails with `SQLITE_CANTOPEN` only if the database does not
   exist, and with `SQLITE_BUSY` if another instance has it open. Other failures, such as an unreachable server, give
   `SQLITE_IOERR`. An application can therefore tell a database that is not stored from one it cannot reach.
-- **Why a database stopped.** After a failed commit or read, `RemoteVfs::failure()` tells why the open database no
-  longer accepts writes: `TakenOver` (another instance took it over), `Unreachable`, `Denied` (access token),
+- **Why a database stopped.** After a failed commit or read, `RemoteVfs::failure()` tells why the open database can
+  no longer be used: `TakenOver` (another instance took it over), `Unreachable`, `Denied` (access token),
   `Rejected` or `Full`. Closing and opening the database again resets it.
+- **Healing after an outage.** A database that failed as `Unreachable` heals by itself on the same SQLite
+  connection. While the server is gone, every access fails at once; in the background the VFS tries to connect. The
+  first access after the server accepted a connection resumes the lease and reloads the database as of the server's
+  version. With a journal on the VFS (journal mode `DELETE`, SQLite's default, `TRUNCATE` or `PERSIST`), SQLite then
+  rolls a commit that failed back, also if it had reached the server. With journal mode `MEMORY` the database keeps
+  the server's version, with or without that commit. A takeover during the outage is reported as `TakenOver`.
 - **Cache (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
   databases of one key keep their own caches. Reads are served from it without a round trip. It contains only data
   the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale cache is
