@@ -1,7 +1,6 @@
 //! A database on the server: the lease, the version and the local copy. The blocks in memory are in [`Pages`], which
 //! loads missing blocks through [`Fetch`].
 
-use std::thread;
 use std::time::Duration;
 
 use sqlite_remote_protocol::v1::{self as pb, client_frame, server_frame};
@@ -631,7 +630,7 @@ impl Remote {
                 Err(err) if Moment::now() >= deadline => {
                     return Err(self.break_with(Broken::Uncertain(format!("no connection to the server: {err}"))));
                 }
-                Err(_) => thread::sleep(RECONNECT_PAUSE),
+                Err(_) => crate::platform::pause(RECONNECT_PAUSE),
             }
         }
     }

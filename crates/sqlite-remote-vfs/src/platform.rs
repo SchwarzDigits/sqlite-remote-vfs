@@ -54,6 +54,10 @@ mod imp {
     pub(crate) fn sleep(dur: Duration) {
         std::thread::sleep(dur);
     }
+
+    pub(crate) fn pause(dur: Duration) {
+        std::thread::sleep(dur);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -81,7 +85,16 @@ mod imp {
     /// Does nothing. SQLite calls this only while waiting for a lock, which cannot happen with one connection per
     /// database. Busy-waiting instead would freeze the worker.
     pub(crate) fn sleep(_dur: Duration) {}
+
+    /// Blocks the SQLite worker in `Atomics.wait`, which does not busy-wait. `std::thread::sleep` is not available in
+    /// a browser. Used between reconnect attempts, while the worker is blocked in a commit anyway.
+    pub(crate) fn pause(dur: Duration) {
+        let cell = js_sys::Int32Array::new(&js_sys::SharedArrayBuffer::new(4));
+        let _ = js_sys::Atomics::wait_with_timeout(&cell, 0, 0, dur.as_secs_f64() * 1000.0);
+    }
 }
 
 use imp::millis_since_start;
+/// Blocks the calling thread for `dur`, also in a browser.
+pub(crate) use imp::pause;
 pub(crate) use imp::{epoch_millis, sleep};
