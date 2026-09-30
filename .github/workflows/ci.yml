@@ -204,6 +204,13 @@ jobs:
         run: GECKODRIVER="$GECKOWEBDRIVER/geckodriver" ./test.sh --firefox
       - name: Test in Chrome
         run: CHROMEDRIVER="$CHROMEWEBDRIVER/chromedriver" ./test.sh --chrome
+      # On a fresh runner the first start of Edge under msedgedriver sometimes never finishes loading its first page,
+      # and the test runner waits until its timeout. Later starts are not affected, and a first start without the
+      # driver finishes. So start Edge once before the tests.
+      - name: Start Edge once
+        run: |
+          timeout --kill-after=5 120 microsoft-edge --headless --no-sandbox --disable-dev-shm-usage \
+            --dump-dom 'data:text/html,' > /dev/null 2>&1 || true
       - name: Test in Edge
         run: MSEDGEDRIVER="$EDGEWEBDRIVER/msedgedriver" ./test.sh --edge
 
