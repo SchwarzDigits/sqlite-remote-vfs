@@ -8,7 +8,7 @@ pub struct ClientFrame {
     /// 14 is reserved for recovery after a server restore.
     #[prost(
         oneof = "client_frame::Body",
-        tags = "10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21"
+        tags = "10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21, 22"
     )]
     pub body: ::core::option::Option<client_frame::Body>,
 }
@@ -39,6 +39,8 @@ pub mod client_frame {
         ClaimSlot(super::ClaimSlot),
         #[prost(message, tag = "21")]
         DeleteSlot(super::DeleteSlot),
+        #[prost(message, tag = "22")]
+        SetSlotLabel(super::SetSlotLabel),
     }
 }
 /// A frame from the server to the client.
@@ -370,24 +372,31 @@ pub struct Delete {
 }
 /// Makes the key of this connection the holder of its owner's slot. Answered with `Slot`.
 ///
-/// Slots need access tokens: the owner is the token's `sub`. An owner has one slot. The slot's label is taken from a
-/// token claim that the server names in its configuration, e.g. the id of the client's device; without that claim the
-/// label is empty. While the slot is held, opening a database with another key of the same owner fails with
-/// ERROR_CODE_SLOT_TAKEN, also when resuming a lease.
+/// Slots need access tokens: the owner is the token's `sub`. An owner has one slot. While the slot is held, opening a
+/// database with another key of the same owner fails with ERROR_CODE_SLOT_TAKEN, also when resuming a lease.
 ///
-/// If another key holds the slot, the slot passes to this key, and all databases of the other key are deleted
-/// completely, without the record that `Delete` keeps. Instances that have them open receive `LeaseRevoked` if they
-/// are connected to the same server instance; in any case their next request on them fails with ERROR_CODE_FENCED.
-/// Claiming a slot that this key already holds succeeds and updates the label. A server without access tokens answers
-/// with ERROR_CODE_BAD_REQUEST.
+/// If another key holds the slot, the slot passes to this key with an empty label, and all databases of the other key
+/// are deleted completely, without the record that `Delete` keeps. Instances that have them open receive
+/// `LeaseRevoked` if they are connected to the same server instance; in any case their next request on them fails
+/// with ERROR_CODE_FENCED. Claiming a slot that this key already holds changes nothing. A server without access tokens
+/// answers with ERROR_CODE_BAD_REQUEST.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ClaimSlot {}
+/// Sets the label of the owner's slot, e.g. the id of the device that holds it. Only the key that holds the slot can
+/// set it: for another key the request fails with ERROR_CODE_SLOT_TAKEN, without a slot with ERROR_CODE_NOT_FOUND. It
+/// never passes or deletes anything. Answered with `Slot`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SetSlotLabel {
+    /// At most 256 bytes. Empty clears the label.
+    #[prost(string, tag = "1")]
+    pub label: ::prost::alloc::string::String,
+}
 /// Releases the owner's slot and deletes all databases of the key of this connection completely, without the record
 /// that `Delete` keeps. Answered with `Ok`, also if the owner has no slot. If another key holds the slot, nothing is
 /// deleted and the request fails with ERROR_CODE_SLOT_TAKEN. No database may be open on this connection.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteSlot {}
-/// The owner's slot, in answer to `ClaimSlot`.
+/// The owner's slot, in answer to `ClaimSlot` and `SetSlotLabel`.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Slot {
     #[prost(string, tag = "1")]

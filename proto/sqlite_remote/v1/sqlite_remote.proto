@@ -27,6 +27,7 @@ message ClientFrame {
     Changed changed = 19;
     ClaimSlot claim_slot = 20;
     DeleteSlot delete_slot = 21;
+    SetSlotLabel set_slot_label = 22;
   }
 }
 
@@ -287,24 +288,30 @@ message Delete {
 
 // Makes the key of this connection the holder of its owner's slot. Answered with `Slot`.
 //
-// Slots need access tokens: the owner is the token's `sub`. An owner has one slot. The slot's label is taken from a
-// token claim that the server names in its configuration, e.g. the id of the client's device; without that claim the
-// label is empty. While the slot is held, opening a database with another key of the same owner fails with
-// ERROR_CODE_SLOT_TAKEN, also when resuming a lease.
+// Slots need access tokens: the owner is the token's `sub`. An owner has one slot. While the slot is held, opening a
+// database with another key of the same owner fails with ERROR_CODE_SLOT_TAKEN, also when resuming a lease.
 //
-// If another key holds the slot, the slot passes to this key, and all databases of the other key are deleted
-// completely, without the record that `Delete` keeps. Instances that have them open receive `LeaseRevoked` if they
-// are connected to the same server instance; in any case their next request on them fails with ERROR_CODE_FENCED.
-// Claiming a slot that this key already holds succeeds and updates the label. A server without access tokens answers
-// with ERROR_CODE_BAD_REQUEST.
+// If another key holds the slot, the slot passes to this key with an empty label, and all databases of the other key
+// are deleted completely, without the record that `Delete` keeps. Instances that have them open receive
+// `LeaseRevoked` if they are connected to the same server instance; in any case their next request on them fails
+// with ERROR_CODE_FENCED. Claiming a slot that this key already holds changes nothing. A server without access tokens
+// answers with ERROR_CODE_BAD_REQUEST.
 message ClaimSlot {}
+
+// Sets the label of the owner's slot, e.g. the id of the device that holds it. Only the key that holds the slot can
+// set it: for another key the request fails with ERROR_CODE_SLOT_TAKEN, without a slot with ERROR_CODE_NOT_FOUND. It
+// never passes or deletes anything. Answered with `Slot`.
+message SetSlotLabel {
+  // At most 256 bytes. Empty clears the label.
+  string label = 1;
+}
 
 // Releases the owner's slot and deletes all databases of the key of this connection completely, without the record
 // that `Delete` keeps. Answered with `Ok`, also if the owner has no slot. If another key holds the slot, nothing is
 // deleted and the request fails with ERROR_CODE_SLOT_TAKEN. No database may be open on this connection.
 message DeleteSlot {}
 
-// The owner's slot, in answer to `ClaimSlot`.
+// The owner's slot, in answer to `ClaimSlot` and `SetSlotLabel`.
 message Slot {
   string label = 1;
   // Time the slot passed to its current key, in milliseconds since the Unix epoch.

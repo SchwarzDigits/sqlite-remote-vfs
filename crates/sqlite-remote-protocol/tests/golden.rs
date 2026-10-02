@@ -12,7 +12,7 @@ use prost::Message;
 use sqlite_remote_protocol::v1::{
     Block, Challenge, Changed, Changes, ClaimSlot, ClientFrame, CloseDb, Commit, CommitAck, Delete, DeleteSlot, Error,
     ErrorCode, Fetch, Hello, HelloOk, LeaseRevoked, Ok, Open, Opened, Pages, Ping, Pong, Proof, Range, Resume,
-    ServerFrame, SigAlg, Slot, client_frame, server_frame,
+    ServerFrame, SetSlotLabel, SigAlg, Slot, client_frame, server_frame,
 };
 
 const DB_ID: &str = "keystore";
@@ -340,6 +340,15 @@ fn samples() -> Vec<(&'static str, Frame)> {
             ),
         ),
         ("client_delete_slot", client(9, C::DeleteSlot(DeleteSlot {}))),
+        (
+            "client_set_slot_label",
+            client(
+                10,
+                C::SetSlotLabel(SetSlotLabel {
+                    label: "device-2".into(),
+                }),
+            ),
+        ),
         (
             "server_error_slot_taken",
             server(
