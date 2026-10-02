@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-remote-protocol"
-version = "0.2.0"
+version = "0.3.0"
 description = "Protocol messages between the VFS client and the page server"
 edition.workspace = true
 license.workspace = true

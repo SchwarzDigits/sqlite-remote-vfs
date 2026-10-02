@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-remote-harness"
-version = "0.2.0"
+version = "0.3.0"
 description = "Crash, fault, load and latency tests for sqlite-remote-vfs against a running server"
 edition.workspace = true
 license.workspace = true
