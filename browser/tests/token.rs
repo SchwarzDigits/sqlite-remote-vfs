@@ -1,5 +1,5 @@
-//! Access tokens in the browser, against a server that admits only clients with one. The token is sent by the
-//! connection worker's connection; a rejected token and a renewal reopen that connection through the bridge.
+//! Access tokens and slots in the browser, against a server that admits only clients with a token. The token is sent
+//! by the connection worker's connection; a rejected token and a renewal reopen that connection through the bridge.
 //!
 //! Requires `SQLITE_REMOTE_TEST_GATED_URL` at compile time, a server set up as described in
 //! `crates/sqlite-remote-vfs/tests/token.rs`. Without it the tests return immediately and pass.
@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::Signer as _;
-use rusqlite::{Connection, OpenFlags};
-use sqlite_remote_vfs::{Config, RemoteVfs, Server, Signer, Store, TokenSource, Zeroizing};
+use rusqlite::{Connection, ErrorCode, OpenFlags};
+use sqlite_remote_vfs::{Config, Failure, RemoteVfs, Server, Signer, Store, TokenSource, Zeroizing};
 use sqlite_wasm_rs as _;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -33,9 +33,14 @@ fn now() -> u64 {
 }
 
 fn token_for(url: &str, client: &[u8], expires: u64) -> String {
+    device_token(url, client, "user@example.test", "", expires)
+}
+
+/// Returns a token for `client` of `owner`, with `label` in the slot label claim `device`.
+fn device_token(url: &str, client: &[u8], owner: &str, label: &str, expires: u64) -> String {
     let header = r#"{"alg":"EdDSA","kid":"test","typ":"JWT"}"#;
     let claims = format!(
-        r#"{{"iss":"sqlite-remote-vfs-tests","aud":"{url}","sub":"user@example.test","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
+        r#"{{"iss":"sqlite-remote-vfs-tests","aud":"{url}","sub":"{owner}","device":"{label}","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
         now() - 10,
         URL_SAFE_NO_PAD.encode(client),
     );
@@ -149,4 +154,47 @@ async fn connection_is_renewed_before_the_token_expires() {
         source.calls.load(Ordering::SeqCst) >= 3,
         "a new token for every renewal"
     );
+}
+
+/// Registers a VFS for a new key of `owner`, labeled `label`.
+async fn device(url: &'static str, owner: &str, label: &str) -> RemoteVfs {
+    let signer = common::key();
+    let public = signer.public_key();
+    let (owner, label) = (owner.to_string(), label.to_string());
+    let source = tokens(move |_| device_token(url, &public, &owner, &label, now() + 3600));
+    register(url, &signer, Some(source)).await.unwrap()
+}
+
+#[wasm_bindgen_test]
+async fn slot_is_claimed_and_deleted_through_the_connection_worker() {
+    let Some(url) = GATED else { return };
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).unwrap();
+    let owner: String = random.iter().map(|b| format!("{b:02x}")).collect();
+
+    let a = device(url, &owner, "device-a").await;
+    assert_eq!(a.claim_slot().unwrap().label, "device-a");
+    let conn_a = open(&a);
+    conn_a.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+
+    let b = device(url, &owner, "device-b").await;
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let err = Connection::open_with_flags_and_vfs("db", flags, b.name())
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0)))
+        .expect_err("the slot belongs to a");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::PermissionDenied), "{err}");
+    let claimed = b.claim_slot().unwrap();
+    assert_eq!(claimed.replaced_label.as_deref(), Some("device-a"));
+
+    conn_a
+        .execute("INSERT INTO t VALUES (1)", [])
+        .expect_err("a no longer writes");
+    assert_eq!(a.failure(), Some(Failure::TakenOver));
+
+    let conn_b = open(&b);
+    conn_b.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    drop(conn_b);
+    b.delete_slot().unwrap();
+    drop(conn_a);
+    open(&a);
 }

@@ -494,6 +494,19 @@ pub(crate) fn delete_database(data: &AppData, name: &str) -> Result<(), crate::E
     }
 }
 
+/// Releases the owner's slot and deletes all databases of the key on the server. Fails if a database is open on this
+/// VFS.
+pub(crate) fn delete_slot(data: &AppData) -> Result<(), crate::Error> {
+    // Held throughout, so that no database can be opened meanwhile.
+    let files = lock(&data.files);
+    if let Some(open) = &files.database {
+        return Err(crate::Error::new(format!(
+            "{open} is open; close it before deleting the slot"
+        )));
+    }
+    with_client(data, "deleting the slot", Client::delete_slot)
+}
+
 /// Deletes a database on the page server, then its cache if the cache belongs to it.
 fn delete_on_server(data: &AppData, name: &str) -> Result<(), crate::Error> {
     let server = data.server();
@@ -529,11 +542,34 @@ fn delete_on_server(data: &AppData, name: &str) -> Result<(), crate::Error> {
     })
 }
 
+/// Runs `call` on the connection to the server, after reconnecting if it is broken. For requests that concern the
+/// key rather than one database.
+pub(crate) fn with_client<T>(
+    data: &AppData,
+    what: &str,
+    call: impl FnOnce(&mut Client) -> Result<T, crate::client::ClientError>,
+) -> Result<T, crate::Error> {
+    match &data.backend {
+        Backend::Server(server) => {
+            let mut client = lock(&server.client);
+            if !client.is_connected() {
+                client
+                    .reconnect()
+                    .map_err(|err| crate::Error::client("connecting", err))?;
+            }
+            call(&mut client).map_err(|err| crate::Error::client(what, err))
+        }
+        #[cfg(target_arch = "wasm32")]
+        Backend::Local(_) => Err(crate::Error::new(format!("{what}: local databases have no server"))),
+    }
+}
+
 /// Opens the database on the page server or locally. Fails if this VFS already has a database open.
 ///
 /// SQLite gets `SQLITE_CANTOPEN` only if the database does not exist and `create` is false, `SQLITE_BUSY` if another
-/// instance has it open, and `SQLITE_AUTH` if the server rejects the access token. Every other failure, e.g. of the
-/// connection, is `SQLITE_IOERR`, so that an application can tell a missing database from one it cannot reach.
+/// instance has it open, `SQLITE_AUTH` if the server rejects the access token, and `SQLITE_PERM` if another key holds
+/// the owner's slot. Every other failure, e.g. of the connection, is `SQLITE_IOERR`, so that an application can tell a
+/// missing database from one it cannot reach.
 fn open_database(data: &AppData, name: &str, create: bool) -> VfsResult<Db> {
     let mut files = lock(&data.files);
     if let Some(open) = &files.database {
@@ -604,6 +640,7 @@ fn open_on_server(data: &AppData, server: &ServerBackend, name: &str, create: bo
     match Database::open(&mut client, name, options, &mut lock(&data.stats)) {
         Ok(db) => Ok(db),
         Err(err) if err.is_lease_held() => Err(io_error(VfsErrorCode::Busy, err.to_string())),
+        Err(err) if err.is_slot_taken() => Err(io_error(VfsErrorCode::Permission, err.to_string())),
         Err(err) if err.is_not_found() => Err(io_error(VfsErrorCode::CantOpen, err.to_string())),
         Err(err) => Err(io_error(VfsErrorCode::Io, err.to_string())),
     }

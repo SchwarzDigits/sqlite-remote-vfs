@@ -286,11 +286,12 @@ pub enum Failure {
     Full,
 }
 
-/// Error returned when registering a VFS or deleting a database fails.
+/// Error returned when registering a VFS, deleting a database or changing the slot fails.
 #[derive(Debug)]
 pub struct Error {
     message: String,
     access_denied: bool,
+    slot_taken: bool,
 }
 
 impl Error {
@@ -298,6 +299,7 @@ impl Error {
         Error {
             message: message.into(),
             access_denied: false,
+            slot_taken: false,
         }
     }
 
@@ -306,6 +308,7 @@ impl Error {
         Error {
             message: format!("{context}: {err}"),
             access_denied: err.is_access_denied(),
+            slot_taken: err.is_slot_taken(),
         }
     }
 
@@ -313,6 +316,24 @@ impl Error {
     pub fn is_access_denied(&self) -> bool {
         self.access_denied
     }
+
+    /// Whether another key holds the slot of the access token's owner. See [`RemoteVfs::claim_slot`].
+    pub fn is_slot_taken(&self) -> bool {
+        self.slot_taken
+    }
+}
+
+/// The slot of an access token's owner, as [`RemoteVfs::claim_slot`] returns it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Slot {
+    /// Label from the access token, e.g. the ID of the device that holds the slot. Empty if the server reads no label
+    /// from the token.
+    pub label: String,
+    /// When this key claimed the slot, in milliseconds since the Unix epoch.
+    pub claimed_at_ms: u64,
+    /// Label of the key that held the slot before, if this claim took it from another key. That key's databases were
+    /// deleted.
+    pub replaced_label: Option<String>,
 }
 
 impl fmt::Display for Error {
@@ -448,6 +469,37 @@ impl RemoteVfs {
     /// `SQLITE_OPEN_CREATE` creates it empty, and it may then use another page size and another key.
     pub fn delete_database(&self, name: &str) -> Result<(), Error> {
         crate::vfs::delete_database(&self.inner, name)
+    }
+
+    /// Passes the slot of the access token's owner to this VFS's key, on a server with access tokens. Every owner (the
+    /// token's `sub`) has at most one slot; once it has one, only the key that holds it opens databases. Opening with
+    /// another key fails with `SQLITE_PERM`.
+    ///
+    /// If another key held the slot, the server deletes all of that key's databases completely, and an instance that
+    /// has one of them open fails with [`Failure::TakenOver`]. Claiming a slot this key already holds changes nothing
+    /// but the label. Databases of this key that are open on this VFS stay open.
+    pub fn claim_slot(&self) -> Result<Slot, Error> {
+        let slot = crate::vfs::with_client(&self.inner, "claiming the slot", Client::claim_slot)?;
+        Ok(Slot {
+            label: slot.label,
+            claimed_at_ms: slot.claimed_at_ms,
+            replaced_label: (!slot.replaced_label.is_empty()).then_some(slot.replaced_label),
+        })
+    }
+
+    /// Releases the slot of the access token's owner and deletes all databases of this VFS's key on the server,
+    /// completely. Only the key that holds the slot can do this; for another key it fails with
+    /// [`Error::is_slot_taken`]. Without a slot, it deletes the key's databases.
+    ///
+    /// No database may be open on this VFS. Instances of this key elsewhere that have a database open fail with
+    /// [`Failure::TakenOver`]. Caches on this device stay; to remove them, delete each database with
+    /// [`RemoteVfs::delete_database`] first.
+    ///
+    /// The deletion leaves no record on the server, so do not use this key again: a cache of one of its databases
+    /// would be ahead of a new, empty database of the same name, and opening it would fail. The same holds for a key
+    /// whose slot another key claimed.
+    pub fn delete_slot(&self) -> Result<(), Error> {
+        crate::vfs::delete_slot(&self.inner)
     }
 
     /// Marks the connection to the server as broken, as after a network failure. The next request reconnects. For

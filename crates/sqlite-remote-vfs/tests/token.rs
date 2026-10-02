@@ -1,11 +1,12 @@
-//! Access tokens against a server that admits only clients with one. They need `SQLITE_REMOTE_TEST_GATED_URL`, a
-//! server started with the JWKS in `tests/data/token-jwks.json`, the issuer `sqlite-remote-vfs-tests` and a token
-//! leeway of 1 s, and are skipped without it:
+//! Access tokens and slots against a server that admits only clients with a token. They need
+//! `SQLITE_REMOTE_TEST_GATED_URL`, a server started with the JWKS in `tests/data/token-jwks.json`, the issuer
+//! `sqlite-remote-vfs-tests`, a token leeway of 1 s and the slot label claim `device`, and are skipped without it:
 //!
 //! ```sh
 //! SQLITE_REMOTE_PORT=18091 SQLITE_REMOTE_SERVER_ID=ws://127.0.0.1:18091/v1/ws SQLITE_REMOTE_STORE=memory \
 //!   SQLITE_REMOTE_TOKEN_JWKS_FILE=crates/sqlite-remote-vfs/tests/data/token-jwks.json \
-//!   SQLITE_REMOTE_TOKEN_ISSUER=sqlite-remote-vfs-tests SQLITE_REMOTE_TOKEN_LEEWAY=1s sqlite-remote-server
+//!   SQLITE_REMOTE_TOKEN_ISSUER=sqlite-remote-vfs-tests SQLITE_REMOTE_TOKEN_LEEWAY=1s \
+//!   SQLITE_REMOTE_TOKEN_SLOT_LABEL_CLAIM=device sqlite-remote-server
 //! ```
 //!
 //! The tests sign the tokens themselves, with the key whose public half is in the JWKS.
@@ -18,7 +19,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ed25519_dalek::Signer as _;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
-use sqlite_remote_vfs::{Algorithm, Config, Failure, RemoteVfs, Server, Signer, Store, TokenSource, Zeroizing};
+use sqlite_remote_vfs::{Algorithm, Config, Failure, RemoteVfs, Server, Signer, Slot, Store, TokenSource, Zeroizing};
 
 /// Private key of the test token service. Its public key is in `tests/data/token-jwks.json`.
 const SERVICE_SEED: [u8; 32] = [0x7a; 32];
@@ -62,9 +63,14 @@ fn now() -> u64 {
 
 /// Returns a token for `client` from the test token service, valid from 10 s ago until `expires` (Unix seconds).
 fn token_for(url: &str, client: &[u8], expires: u64) -> String {
+    device_token(url, client, "user@example.test", "", expires)
+}
+
+/// Returns a token for `client` of `owner`, with `label` in the slot label claim `device`.
+fn device_token(url: &str, client: &[u8], owner: &str, label: &str, expires: u64) -> String {
     let header = r#"{"alg":"EdDSA","kid":"test","typ":"JWT"}"#;
     let claims = format!(
-        r#"{{"iss":"{ISSUER}","aud":"{url}","sub":"user@example.test","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
+        r#"{{"iss":"{ISSUER}","aud":"{url}","sub":"{owner}","device":"{label}","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
         now() - 10,
         URL_SAFE_NO_PAD.encode(client),
     );
@@ -263,4 +269,81 @@ fn open_after_the_token_expired_reconnects_first() {
     std::thread::sleep(Duration::from_millis(5000));
     let conn = open(&vfs).expect("open with a new token");
     assert_eq!(count(&conn), 0);
+}
+
+/// A random owner, so that the slot tests do not share slots.
+fn fresh_owner() -> String {
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).unwrap();
+    random.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Registers a VFS for a new key of `owner`, labeled `label`.
+fn device(url: &str, owner: &str, label: &str) -> RemoteVfs {
+    let key = Key::fresh();
+    let public = key.public_key();
+    let source = {
+        let (url, owner, label) = (url.to_string(), owner.to_string(), label.to_string());
+        tokens(move |_| Ok(device_token(&url, &public, &owner, &label, now() + 3600)))
+    };
+    register(url, &key, Some(source)).unwrap()
+}
+
+#[test]
+fn claimed_slot_replaces_the_other_key_and_its_databases() {
+    let Some(url) = gated_url() else { return };
+    let owner = fresh_owner();
+    let a = device(&url, &owner, "device-a");
+    let claimed = a.claim_slot().unwrap();
+    assert_eq!(claimed.label, "device-a");
+    assert_eq!(claimed.replaced_label, None);
+    assert_eq!(a.claim_slot().unwrap(), claimed, "claiming again changes nothing");
+    let conn_a = open(&a).unwrap();
+    conn_a.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1)", []).unwrap();
+
+    let b = device(&url, &owner, "device-b");
+    let err = open(&b).expect_err("the slot belongs to a");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::PermissionDenied), "{err}");
+    let Slot {
+        label, replaced_label, ..
+    } = b.claim_slot().unwrap();
+    assert_eq!(
+        (label.as_str(), replaced_label.as_deref()),
+        ("device-b", Some("device-a"))
+    );
+    let conn_b = open(&b).unwrap();
+    let tables: i64 = conn_b
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tables, 0, "the databases of a were deleted");
+
+    conn_a
+        .execute("INSERT INTO t VALUES (2)", [])
+        .expect_err("a no longer writes");
+    assert_eq!(a.failure(), Some(Failure::TakenOver));
+}
+
+#[test]
+fn deleted_slot_takes_the_databases_with_it() {
+    let Some(url) = gated_url() else { return };
+    let owner = fresh_owner();
+    let a = device(&url, &owner, "device-a");
+    a.claim_slot().unwrap();
+    let conn = open(&a).unwrap();
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    a.delete_slot().expect_err("the database is open");
+    drop(conn);
+
+    let b = device(&url, &owner, "device-b");
+    let err = b.delete_slot().expect_err("only the key of the slot deletes it");
+    assert!(err.is_slot_taken(), "{err}");
+
+    a.delete_slot().unwrap();
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let err = Connection::open_with_flags_and_vfs("db", flags, a.name())
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0)))
+        .expect_err("the database is gone");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::CannotOpen), "{err}");
+    open(&b).expect("without a slot, every key opens its own databases");
 }

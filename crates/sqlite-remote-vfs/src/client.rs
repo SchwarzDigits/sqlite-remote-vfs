@@ -46,8 +46,14 @@ pub(crate) enum ClientError {
 }
 
 impl ClientError {
+    /// The database was taken over: another instance took its lease, or another key took the owner's slot.
     pub fn is_fenced(&self) -> bool {
-        matches!(self, Self::Server(e) if e.code() == pb::ErrorCode::Fenced)
+        matches!(self, Self::Server(e) if matches!(e.code(), pb::ErrorCode::Fenced | pb::ErrorCode::SlotTaken))
+    }
+
+    /// Another key holds the slot of the access token's owner.
+    pub fn is_slot_taken(&self) -> bool {
+        matches!(self, Self::Server(e) if e.code() == pb::ErrorCode::SlotTaken)
     }
 
     pub fn is_lease_held(&self) -> bool {
@@ -297,6 +303,24 @@ impl Client {
             takeover,
         }))?;
         match answer {
+            server_frame::Body::Ok(_) => Ok(()),
+            other => Err(ClientError::Protocol(format!("expected Ok, got {other:?}"))),
+        }
+    }
+
+    /// Passes the slot of the access token's owner to this client's key. The server deletes the databases of the key
+    /// that held it before.
+    pub fn claim_slot(&mut self) -> Result<pb::Slot, ClientError> {
+        match self.call(client_frame::Body::ClaimSlot(pb::ClaimSlot {}))? {
+            server_frame::Body::Slot(slot) => Ok(slot),
+            other => Err(ClientError::Protocol(format!("expected Slot, got {other:?}"))),
+        }
+    }
+
+    /// Releases the owner's slot and deletes all databases of this client's key. No database may be open on this
+    /// connection.
+    pub fn delete_slot(&mut self) -> Result<(), ClientError> {
+        match self.call(client_frame::Body::DeleteSlot(pb::DeleteSlot {}))? {
             server_frame::Body::Ok(_) => Ok(()),
             other => Err(ClientError::Protocol(format!("expected Ok, got {other:?}"))),
         }

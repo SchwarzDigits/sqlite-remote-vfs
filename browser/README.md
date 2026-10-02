@@ -16,7 +16,7 @@ WebAssembly with SQLite3 Multiple Ciphers.
 | `copy.rs` | Cache in IndexedDB: reopening without fetches, catching up a stale cache, memory limit with reloads from IndexedDB |
 | `nothing_stored.rs` | Without a cache the browser stores nothing of the database |
 | `heal.rs` | A database that failed because the server was unreachable heals on the same connection once the server is back, and the failed commit is rolled back. Needs the relay, see below |
-| `token.rs` | Access tokens: a missing token is denied, a rejected token is asked for once more, and the connection is renewed with a new token before the old one expires. Needs `SQLITE_REMOTE_TEST_GATED_URL`, see `crates/sqlite-remote-vfs/tests/token.rs` |
+| `token.rs` | Access tokens: a missing token is denied, a rejected token is asked for once more, and the connection is renewed with a new token before the old one expires. Slots: claiming replaces the other key, which can no longer write, and deleting releases the slot. Needs `SQLITE_REMOTE_TEST_GATED_URL`, see `crates/sqlite-remote-vfs/tests/token.rs` |
 | `local.rs` | Local databases without a server: commits survive a new VFS, a second instance is busy, a takeover fences the first instance, deletion, namespaces, memory limit, commits and preloads larger than the bridge buffer, and the backup of a local database to a server |
 | `measure.rs` | Commit latency, reopening time and read latency under memory limits, printed as Markdown tables |
 

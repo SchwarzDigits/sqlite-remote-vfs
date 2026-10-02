@@ -37,9 +37,17 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   on the deleted database can no longer commit, also not after the database was created anew. The server also
   deletes databases that have not been used for a configurable time (180 days by default). A cache of a deleted
   database is never used again, also on other devices.
+- **Slots (with access tokens).** A slot ties the token's owner (`sub`) to one key, for applications where a user
+  has exactly one set of databases at a time. `RemoteVfs::claim_slot()` passes the owner's slot to this key; the
+  server deletes the databases of the key that held it before, and that key's open databases fail with `TakenOver`.
+  The result carries the label the server read from the token, e.g. a device ID, and the label it replaced.
+  `RemoteVfs::delete_slot()` releases the slot and deletes all databases of this key. While another key holds the
+  owner's slot, opening fails with `SQLITE_PERM`. The server tells the slot's label without a key, see
+  sqlite-remote-server.
 - **Open errors.** Opening without `SQLITE_OPEN_CREATE` fails with `SQLITE_CANTOPEN` only if the database does not
-  exist, and with `SQLITE_BUSY` if another instance has it open. Other failures, such as an unreachable server, give
-  `SQLITE_IOERR`. An application can therefore tell a database that is not stored from one it cannot reach.
+  exist, with `SQLITE_BUSY` if another instance has it open, and with `SQLITE_PERM` if another key holds the owner's
+  slot. Other failures, such as an unreachable server, give `SQLITE_IOERR`. An application can therefore tell a
+  database that is not stored from one it cannot reach.
 - **Why a database stopped.** After a failed commit or read, `RemoteVfs::failure()` tells why the open database can
   no longer be used: `TakenOver` (another instance took it over), `Unreachable`, `Denied` (access token),
   `Rejected` or `Full`. Closing and opening the database again resets it.
