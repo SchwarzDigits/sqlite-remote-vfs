@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-remote-vfs"
-version = "0.3.0"
+version = "0.4.0"
 description = "SQLite VFS that keeps the database file on a remote page server"
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ publish = false
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 getrandom = "0.3"
 prost = "0.14"
-sqlite-remote-protocol = { version = "0.3.0", path = "../sqlite-remote-protocol" }
+sqlite-remote-protocol = { version = "0.4.0", path = "../sqlite-remote-protocol" }
 rsqlite-vfs = "0.2"
 sha2 = { version = "0.10", default-features = false }
 # Clears the access token from memory when it is dropped.

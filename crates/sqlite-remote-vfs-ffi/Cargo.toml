@@ -1,6 +1,6 @@
 [package]
 name = "sqlite-remote-vfs-ffi"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ description = "C interface to sqlite-remote-vfs, declared in include/sqlite_remo
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-sqlite-remote-vfs = { version = "0.3.0", path = "../sqlite-remote-vfs" }
+sqlite-remote-vfs = { version = "0.4.0", path = "../sqlite-remote-vfs" }
 
 [dev-dependencies]
 # SQLite for the unit test binary, see src/lib.rs.
