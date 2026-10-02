@@ -108,6 +108,9 @@ pub(crate) struct Client {
     revoked: HashMap<String, u64>,
     /// Databases revoked since the last `take_unreported`, for the takeover listener.
     unreported: Vec<String>,
+    /// Number of logins so far. A database opened on an earlier login must be opened again on the current
+    /// connection: the server keeps open databases per connection.
+    logins: u64,
     /// Time from which the connection counts as broken, so that the next request reconnects with a new access token
     /// before the server closes the connection. `None` without a token.
     token_renewal: Option<Moment>,
@@ -131,6 +134,7 @@ impl Client {
             last_request: Moment::now(),
             revoked: HashMap::new(),
             unreported: Vec::new(),
+            logins: 0,
             token_renewal: None,
             trace: config_trace,
         };
@@ -155,6 +159,7 @@ impl Client {
             last_request: Moment::now(),
             revoked: HashMap::new(),
             unreported: Vec::new(),
+            logins: 0,
             token_renewal: None,
             trace,
         };
@@ -185,6 +190,11 @@ impl Client {
     }
 
     /// Whether the server revoked the lease of `db_id` with epoch `lease_epoch`.
+    /// Number of logins so far, see `logins`.
+    pub fn logins(&self) -> u64 {
+        self.logins
+    }
+
     pub fn was_revoked(&self, db_id: &str, lease_epoch: u64) -> bool {
         self.revoked.get(db_id).is_some_and(|&newer| newer > lease_epoch)
     }
@@ -300,6 +310,7 @@ impl Client {
                 if let Some(socket) = &mut self.socket {
                     socket.logged_in(self.limits.ping_interval);
                 }
+                self.logins += 1;
                 Ok(())
             }
             other => Err(ClientError::Protocol(format!("expected HelloOk, got {other:?}"))),
@@ -335,9 +346,19 @@ impl Client {
     }
 
     /// Passes the slot of the access token's owner to this client's key. The server deletes the databases of the key
-    /// that held it before.
+    /// that held it before. A new holder starts with an empty label.
     pub fn claim_slot(&mut self) -> Result<pb::Slot, ClientError> {
         match self.call(client_frame::Body::ClaimSlot(pb::ClaimSlot {}))? {
+            server_frame::Body::Slot(slot) => Ok(slot),
+            other => Err(ClientError::Protocol(format!("expected Slot, got {other:?}"))),
+        }
+    }
+
+    /// Sets the label of the owner's slot, which this client's key must hold.
+    pub fn set_slot_label(&mut self, label: &str) -> Result<pb::Slot, ClientError> {
+        match self.call(client_frame::Body::SetSlotLabel(pb::SetSlotLabel {
+            label: label.into(),
+        }))? {
             server_frame::Body::Slot(slot) => Ok(slot),
             other => Err(ClientError::Protocol(format!("expected Slot, got {other:?}"))),
         }

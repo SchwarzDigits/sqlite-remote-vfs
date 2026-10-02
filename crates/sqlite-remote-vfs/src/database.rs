@@ -59,6 +59,8 @@ struct Remote {
     /// reported to SQLite, because the server has all blocks.
     local: LocalCopy,
     broken: Option<Broken>,
+    /// The client's login on which the database was opened or last resumed. See `Client::logins`.
+    login: u64,
 }
 
 /// Loads missing blocks from the local copy or, if they are missing there, from the server.
@@ -117,6 +119,7 @@ impl Database {
                 None => LocalCopy::None,
             },
             broken: None,
+            login: client.logins(),
         };
 
         remote.fill(client, &mut pages, stats)?;
@@ -244,7 +247,7 @@ impl Database {
         let deadline = started.plus(reconnect_timeout);
 
         let version = loop {
-            if !client.is_connected() {
+            if !remote.on_current_connection(client) {
                 let opened = remote.resume_until(client, pages.page_size(), deadline, stats)?;
                 if opened.version != remote.version {
                     return Err(remote.break_with(Broken::Diverged(format!(
@@ -328,7 +331,7 @@ impl Database {
             client.disconnect();
             return;
         }
-        if !client.is_connected() {
+        if !self.remote.on_current_connection(client) {
             return;
         }
         let _ = client.call(client_frame::Body::CloseDb(pb::CloseDb {
@@ -349,7 +352,7 @@ impl Source for Fetch<'_> {
         if remote.take_from_copy(pages, first, count, stats) {
             return Ok(());
         }
-        if !self.client.is_connected() {
+        if !remote.on_current_connection(self.client) {
             // Reads reconnect once, without a deadline. If that fails, the read fails.
             remote
                 .resume(self.client, pages.page_size(), stats)
@@ -702,9 +705,18 @@ impl Remote {
         }
     }
 
+    /// Whether the database is open on the client's current connection. After a new login, also one made for
+    /// another request, it must be resumed there.
+    fn on_current_connection(&self, client: &Client) -> bool {
+        client.is_connected() && client.logins() == self.login
+    }
+
+    /// Resumes the lease on the current connection, after reconnecting if the connection is broken.
     fn resume(&mut self, client: &mut Client, page_size: usize, stats: &mut Stats) -> Result<pb::Opened, ClientError> {
-        client.reconnect()?;
-        stats.reconnects += 1;
+        if !client.is_connected() {
+            client.reconnect()?;
+            stats.reconnects += 1;
+        }
         let answer = client.call(client_frame::Body::Open(pb::Open {
             db_id: self.db_id.clone(),
             page_size: page_size as u32,
@@ -718,7 +730,10 @@ impl Remote {
             }),
         }))?;
         match answer {
-            server_frame::Body::Opened(opened) => Ok(opened),
+            server_frame::Body::Opened(opened) => {
+                self.login = client.logins();
+                Ok(opened)
+            }
             other => Err(ClientError::Protocol(format!("expected Opened, got {other:?}"))),
         }
     }

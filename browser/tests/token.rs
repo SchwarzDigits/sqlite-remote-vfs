@@ -33,14 +33,14 @@ fn now() -> u64 {
 }
 
 fn token_for(url: &str, client: &[u8], expires: u64) -> String {
-    device_token(url, client, "user@example.test", "", expires)
+    owner_token(url, client, "user@example.test", expires)
 }
 
-/// Returns a token for `client` of `owner`, with `label` in the slot label claim `device`.
-fn device_token(url: &str, client: &[u8], owner: &str, label: &str, expires: u64) -> String {
+/// Returns a token for `client` of `owner`.
+fn owner_token(url: &str, client: &[u8], owner: &str, expires: u64) -> String {
     let header = r#"{"alg":"EdDSA","kid":"test","typ":"JWT"}"#;
     let claims = format!(
-        r#"{{"iss":"sqlite-remote-vfs-tests","aud":"{url}","sub":"{owner}","device":"{label}","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
+        r#"{{"iss":"sqlite-remote-vfs-tests","aud":"{url}","sub":"{owner}","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
         now() - 10,
         URL_SAFE_NO_PAD.encode(client),
     );
@@ -156,12 +156,12 @@ async fn connection_is_renewed_before_the_token_expires() {
     );
 }
 
-/// Registers a VFS for a new key of `owner`, labeled `label`.
-async fn device(url: &'static str, owner: &str, label: &str) -> RemoteVfs {
+/// Registers a VFS for a new key of `owner`.
+async fn device(url: &'static str, owner: &str) -> RemoteVfs {
     let signer = common::key();
     let public = signer.public_key();
-    let (owner, label) = (owner.to_string(), label.to_string());
-    let source = tokens(move |_| device_token(url, &public, &owner, &label, now() + 3600));
+    let owner = owner.to_string();
+    let source = tokens(move |_| owner_token(url, &public, &owner, now() + 3600));
     register(url, &signer, Some(source)).await.unwrap()
 }
 
@@ -172,12 +172,13 @@ async fn slot_is_claimed_and_deleted_through_the_connection_worker() {
     getrandom::fill(&mut random).unwrap();
     let owner: String = random.iter().map(|b| format!("{b:02x}")).collect();
 
-    let a = device(url, &owner, "device-a").await;
-    assert_eq!(a.claim_slot().unwrap().label, "device-a");
+    let a = device(url, &owner).await;
+    assert_eq!(a.claim_slot().unwrap().label, "");
+    assert_eq!(a.set_slot_label("device-a").unwrap().label, "device-a");
     let conn_a = open(&a);
     conn_a.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
 
-    let b = device(url, &owner, "device-b").await;
+    let b = device(url, &owner).await;
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let err = Connection::open_with_flags_and_vfs("db", flags, b.name())
         .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get::<_, i64>(0)))
@@ -185,6 +186,7 @@ async fn slot_is_claimed_and_deleted_through_the_connection_worker() {
     assert_eq!(err.sqlite_error_code(), Some(ErrorCode::PermissionDenied), "{err}");
     let claimed = b.claim_slot().unwrap();
     assert_eq!(claimed.replaced_label.as_deref(), Some("device-a"));
+    assert_eq!(b.set_slot_label("device-b").unwrap().label, "device-b");
 
     conn_a
         .execute("INSERT INTO t VALUES (1)", [])

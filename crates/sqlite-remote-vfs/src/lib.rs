@@ -356,11 +356,10 @@ impl Error {
     }
 }
 
-/// The slot of an access token's owner, as [`RemoteVfs::claim_slot`] returns it.
+/// The slot of an access token's owner, as [`RemoteVfs::claim_slot`] and [`RemoteVfs::set_slot_label`] return it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Slot {
-    /// Label from the access token, e.g. the ID of the device that holds the slot. Empty if the server reads no label
-    /// from the token.
+    /// Label set with [`RemoteVfs::set_slot_label`], e.g. the ID of the device that holds the slot. Empty until then.
     pub label: String,
     /// When this key claimed the slot, in milliseconds since the Unix epoch.
     pub claimed_at_ms: u64,
@@ -518,15 +517,21 @@ impl RemoteVfs {
     /// another key fails with `SQLITE_PERM`.
     ///
     /// If another key held the slot, the server deletes all of that key's databases completely, and an instance that
-    /// has one of them open fails with [`Failure::TakenOver`]. Claiming a slot this key already holds changes nothing
-    /// but the label. Databases of this key that are open on this VFS stay open.
+    /// has one of them open fails with [`Failure::TakenOver`]. The slot then has an empty label until
+    /// [`RemoteVfs::set_slot_label`]. Claiming a slot this key already holds changes nothing. Databases of this key
+    /// that are open on this VFS stay open.
     pub fn claim_slot(&self) -> Result<Slot, Error> {
-        let slot = crate::vfs::with_client(&self.inner, "claiming the slot", Client::claim_slot)?;
-        Ok(Slot {
-            label: slot.label,
-            claimed_at_ms: slot.claimed_at_ms,
-            replaced_label: (!slot.replaced_label.is_empty()).then_some(slot.replaced_label),
+        crate::vfs::with_client(&self.inner, "claiming the slot", Client::claim_slot).map(slot_of)
+    }
+
+    /// Sets the label of the owner's slot, e.g. the ID of the device that holds it, at most 256 bytes. Only the key
+    /// that holds the slot can set it; for another key it fails with [`Error::is_slot_taken`], and without a slot it
+    /// fails too. It never passes the slot or deletes anything.
+    pub fn set_slot_label(&self, label: &str) -> Result<Slot, Error> {
+        crate::vfs::with_client(&self.inner, "setting the slot label", |client| {
+            client.set_slot_label(label)
         })
+        .map(slot_of)
     }
 
     /// Releases the slot of the access token's owner and deletes all databases of this VFS's key on the server,
@@ -560,6 +565,14 @@ impl Drop for RemoteVfs {
     /// Stops the ping thread. The VFS stays registered, because SQLite may still use it.
     fn drop(&mut self) {
         self.inner.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+fn slot_of(slot: sqlite_remote_protocol::v1::Slot) -> Slot {
+    Slot {
+        label: slot.label,
+        claimed_at_ms: slot.claimed_at_ms,
+        replaced_label: (!slot.replaced_label.is_empty()).then_some(slot.replaced_label),
     }
 }
 

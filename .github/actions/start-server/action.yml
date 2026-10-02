@@ -27,9 +27,6 @@ inputs:
   token-leeway:
     description: Allowance for clock differences when checking access tokens, e.g. 1s.
     default: ""
-  token-slot-label-claim:
-    description: Token claim whose value labels a slot, e.g. device.
-    default: ""
 runs:
   using: composite
   steps:
@@ -49,7 +46,6 @@ runs:
         TOKEN_JWKS_FILE: ${{ inputs.token-jwks-file }}
         TOKEN_ISSUER: ${{ inputs.token-issuer }}
         TOKEN_LEEWAY: ${{ inputs.token-leeway }}
-        TOKEN_SLOT_LABEL_CLAIM: ${{ inputs.token-slot-label-claim }}
       run: |
         go install "github.com/SchwarzDigits/sqlite-remote-server/cmd/sqlite-remote-server@$VERSION"
         url="ws://127.0.0.1:$PORT/v1/ws"
@@ -60,7 +56,7 @@ runs:
         SQLITE_REMOTE_PORT="$PORT" SQLITE_REMOTE_SERVER_ID="$url" SQLITE_REMOTE_STORE="$STORE" \
           SQLITE_REMOTE_DATABASE_URL="$DATABASE_URL" SQLITE_REMOTE_ALLOWED_ORIGINS='127.0.0.1:*,localhost:*' \
           SQLITE_REMOTE_TOKEN_JWKS_FILE="$jwks" SQLITE_REMOTE_TOKEN_ISSUER="$TOKEN_ISSUER" \
-          SQLITE_REMOTE_TOKEN_LEEWAY="$TOKEN_LEEWAY" SQLITE_REMOTE_TOKEN_SLOT_LABEL_CLAIM="$TOKEN_SLOT_LABEL_CLAIM" \
+          SQLITE_REMOTE_TOKEN_LEEWAY="$TOKEN_LEEWAY" \
           nohup "$(go env GOPATH)/bin/sqlite-remote-server" > "$log" 2>&1 &
         for _ in $(seq 100); do
           if curl -sf "http://127.0.0.1:$PORT/.well-known/ready" > /dev/null; then
@@ -85,7 +81,6 @@ runs:
         TOKEN_JWKS_FILE: ${{ inputs.token-jwks-file }}
         TOKEN_ISSUER: ${{ inputs.token-issuer }}
         TOKEN_LEEWAY: ${{ inputs.token-leeway }}
-        TOKEN_SLOT_LABEL_CLAIM: ${{ inputs.token-slot-label-claim }}
       run: |
         go install "github.com/SchwarzDigits/sqlite-remote-server/cmd/sqlite-remote-server@$env:VERSION"
         if ($LASTEXITCODE -ne 0) { exit 1 }
@@ -106,7 +101,6 @@ runs:
           "set SQLITE_REMOTE_TOKEN_JWKS_FILE=$jwks"
           "set SQLITE_REMOTE_TOKEN_ISSUER=$env:TOKEN_ISSUER"
           "set SQLITE_REMOTE_TOKEN_LEEWAY=$env:TOKEN_LEEWAY"
-          "set SQLITE_REMOTE_TOKEN_SLOT_LABEL_CLAIM=$env:TOKEN_SLOT_LABEL_CLAIM"
           "`"$exe`" > `"$log`" 2> `"$errors`""
         ) | Set-Content -Path $script -Encoding ascii
         # A process started from this step, also with Start-Process, was gone in the next step. A process that WMI

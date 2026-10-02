@@ -40,8 +40,9 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
 - **Slots (with access tokens).** A slot ties the token's owner (`sub`) to one key, for applications where a user
   has exactly one set of databases at a time. `RemoteVfs::claim_slot()` passes the owner's slot to this key; the
   server deletes the databases of the key that held it before, and that key's open databases fail with `TakenOver`.
-  The result carries the label the server read from the token, e.g. a device ID, and the label it replaced.
-  `RemoteVfs::delete_slot()` releases the slot and deletes all databases of this key. While another key holds the
+  The result names the label of the replaced slot. `RemoteVfs::set_slot_label()` sets the label, e.g. a device ID;
+  only the key that holds the slot can. `RemoteVfs::delete_slot()` releases the slot and deletes all databases of
+  this key. While another key holds the
   owner's slot, opening fails with `SQLITE_PERM`. The server tells the slot's label without a key, see
   sqlite-remote-server.
 - **Open errors.** Opening without `SQLITE_OPEN_CREATE` fails with `SQLITE_CANTOPEN` only if the database does not

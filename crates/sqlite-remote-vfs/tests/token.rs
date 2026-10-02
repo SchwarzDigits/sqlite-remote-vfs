@@ -1,12 +1,11 @@
 //! Access tokens and slots against a server that admits only clients with a token. They need
 //! `SQLITE_REMOTE_TEST_GATED_URL`, a server started with the JWKS in `tests/data/token-jwks.json`, the issuer
-//! `sqlite-remote-vfs-tests`, a token leeway of 1 s and the slot label claim `device`, and are skipped without it:
+//! `sqlite-remote-vfs-tests` and a token leeway of 1 s, and are skipped without it:
 //!
 //! ```sh
 //! SQLITE_REMOTE_PORT=18091 SQLITE_REMOTE_SERVER_ID=ws://127.0.0.1:18091/v1/ws SQLITE_REMOTE_STORE=memory \
 //!   SQLITE_REMOTE_TOKEN_JWKS_FILE=crates/sqlite-remote-vfs/tests/data/token-jwks.json \
-//!   SQLITE_REMOTE_TOKEN_ISSUER=sqlite-remote-vfs-tests SQLITE_REMOTE_TOKEN_LEEWAY=1s \
-//!   SQLITE_REMOTE_TOKEN_SLOT_LABEL_CLAIM=device sqlite-remote-server
+//!   SQLITE_REMOTE_TOKEN_ISSUER=sqlite-remote-vfs-tests SQLITE_REMOTE_TOKEN_LEEWAY=1s sqlite-remote-server
 //! ```
 //!
 //! The tests sign the tokens themselves, with the key whose public half is in the JWKS.
@@ -63,14 +62,14 @@ fn now() -> u64 {
 
 /// Returns a token for `client` from the test token service, valid from 10 s ago until `expires` (Unix seconds).
 fn token_for(url: &str, client: &[u8], expires: u64) -> String {
-    device_token(url, client, "user@example.test", "", expires)
+    owner_token(url, client, "user@example.test", expires)
 }
 
-/// Returns a token for `client` of `owner`, with `label` in the slot label claim `device`.
-fn device_token(url: &str, client: &[u8], owner: &str, label: &str, expires: u64) -> String {
+/// Returns a token for `client` of `owner`.
+fn owner_token(url: &str, client: &[u8], owner: &str, expires: u64) -> String {
     let header = r#"{"alg":"EdDSA","kid":"test","typ":"JWT"}"#;
     let claims = format!(
-        r#"{{"iss":"{ISSUER}","aud":"{url}","sub":"{owner}","device":"{label}","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
+        r#"{{"iss":"{ISSUER}","aud":"{url}","sub":"{owner}","nbf":{},"exp":{expires},"cnf":{{"jwk":{{"kty":"OKP","crv":"Ed25519","x":"{}"}}}}}}"#,
         now() - 10,
         URL_SAFE_NO_PAD.encode(client),
     );
@@ -278,13 +277,13 @@ fn fresh_owner() -> String {
     random.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Registers a VFS for a new key of `owner`, labeled `label`.
-fn device(url: &str, owner: &str, label: &str) -> RemoteVfs {
+/// Registers a VFS for a new key of `owner`.
+fn device(url: &str, owner: &str) -> RemoteVfs {
     let key = Key::fresh();
     let public = key.public_key();
     let source = {
-        let (url, owner, label) = (url.to_string(), owner.to_string(), label.to_string());
-        tokens(move |_| Ok(device_token(&url, &public, &owner, &label, now() + 3600)))
+        let (url, owner) = (url.to_string(), owner.to_string());
+        tokens(move |_| Ok(owner_token(&url, &public, &owner, now() + 3600)))
     };
     register(url, &key, Some(source)).unwrap()
 }
@@ -293,25 +292,30 @@ fn device(url: &str, owner: &str, label: &str) -> RemoteVfs {
 fn claimed_slot_replaces_the_other_key_and_its_databases() {
     let Some(url) = gated_url() else { return };
     let owner = fresh_owner();
-    let a = device(&url, &owner, "device-a");
+    let a = device(&url, &owner);
     let claimed = a.claim_slot().unwrap();
-    assert_eq!(claimed.label, "device-a");
+    assert_eq!(claimed.label, "", "a claimed slot has no label yet");
     assert_eq!(claimed.replaced_label, None);
-    assert_eq!(a.claim_slot().unwrap(), claimed, "claiming again changes nothing");
+    let labeled = a.set_slot_label("device-a").unwrap();
+    assert_eq!(labeled.label, "device-a");
+    assert_eq!(labeled.claimed_at_ms, claimed.claimed_at_ms);
+    assert_eq!(a.claim_slot().unwrap(), labeled, "claiming again changes nothing");
     let conn_a = open(&a).unwrap();
     conn_a.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
     conn_a.execute("INSERT INTO t VALUES (1)", []).unwrap();
 
-    let b = device(&url, &owner, "device-b");
+    let b = device(&url, &owner);
     let err = open(&b).expect_err("the slot belongs to a");
     assert_eq!(err.sqlite_error_code(), Some(ErrorCode::PermissionDenied), "{err}");
+    let err = b
+        .set_slot_label("device-b")
+        .expect_err("only the holder labels the slot");
+    assert!(err.is_slot_taken(), "{err}");
     let Slot {
         label, replaced_label, ..
     } = b.claim_slot().unwrap();
-    assert_eq!(
-        (label.as_str(), replaced_label.as_deref()),
-        ("device-b", Some("device-a"))
-    );
+    assert_eq!((label.as_str(), replaced_label.as_deref()), ("", Some("device-a")));
+    assert_eq!(b.set_slot_label("device-b").unwrap().label, "device-b");
     let conn_b = open(&b).unwrap();
     let tables: i64 = conn_b
         .query_row("SELECT count(*) FROM sqlite_schema", [], |row| row.get(0))
@@ -324,18 +328,36 @@ fn claimed_slot_replaces_the_other_key_and_its_databases() {
     assert_eq!(a.failure(), Some(Failure::TakenOver));
 }
 
+/// The slot calls log in again if the connection broke. A database open on the VFS is then opened again on the new
+/// connection before its next request.
+#[test]
+fn open_database_survives_a_new_login_for_a_slot_call() {
+    let Some(url) = gated_url() else { return };
+    let vfs = device(&url, &fresh_owner());
+    vfs.claim_slot().unwrap();
+    let conn = open(&vfs).unwrap();
+    conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+
+    vfs.drop_connection();
+    vfs.set_slot_label("device-a").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)", [])
+        .expect("the database is opened again on the new connection");
+    assert_eq!(count(&conn), 1);
+    assert_eq!(vfs.failure(), None);
+}
+
 #[test]
 fn deleted_slot_takes_the_databases_with_it() {
     let Some(url) = gated_url() else { return };
     let owner = fresh_owner();
-    let a = device(&url, &owner, "device-a");
+    let a = device(&url, &owner);
     a.claim_slot().unwrap();
     let conn = open(&a).unwrap();
     conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
     a.delete_slot().expect_err("the database is open");
     drop(conn);
 
-    let b = device(&url, &owner, "device-b");
+    let b = device(&url, &owner);
     let err = b.delete_slot().expect_err("only the key of the slot deletes it");
     assert!(err.is_slot_taken(), "{err}");
 

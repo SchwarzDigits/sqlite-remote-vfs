@@ -17,7 +17,7 @@ env:
   CARGO_TERM_COLOR: always
   # Commit of github.com/SchwarzDigits/sqlite-remote-server that the tests run against. Raised deliberately, after
   # the server's own CI passed.
-  SERVER_VERSION: 257e0c1b63a7092a331ad7767984cc3058118e28
+  SERVER_VERSION: dd94c6d28cc2f561e427023299de49d960ca0b66
 
 # Every job starts that server with the start-server action, which sets SQLITE_REMOTE_TEST_URL. The tests that need a
 # server skip themselves without it. The native and browser jobs start a second one that admits only clients with an
@@ -47,7 +47,6 @@ jobs:
           token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
           token-issuer: sqlite-remote-vfs-tests
           token-leeway: 1s
-          token-slot-label-claim: device
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -191,7 +190,6 @@ jobs:
           token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
           token-issuer: sqlite-remote-vfs-tests
           token-leeway: 1s
-          token-slot-label-claim: device
       # Relay in front of the first server, which heal.rs stops and resumes through the control port.
       - name: Start relay
         run: |
@@ -265,7 +263,6 @@ jobs:
           token-jwks-file: crates/sqlite-remote-vfs/tests/data/token-jwks.json
           token-issuer: sqlite-remote-vfs-tests
           token-leeway: 1s
-          token-slot-label-claim: device
       # Relay in front of the first server, which heal.rs stops and resumes through the control port.
       - name: Start relay
         run: |
