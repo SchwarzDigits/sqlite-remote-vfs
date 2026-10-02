@@ -6,7 +6,10 @@ pub struct ClientFrame {
     #[prost(uint64, tag = "1")]
     pub request_id: u64,
     /// 14 is reserved for recovery after a server restore.
-    #[prost(oneof = "client_frame::Body", tags = "10, 11, 12, 13, 15, 16, 17, 18, 19")]
+    #[prost(
+        oneof = "client_frame::Body",
+        tags = "10, 11, 12, 13, 15, 16, 17, 18, 19, 20, 21"
+    )]
     pub body: ::core::option::Option<client_frame::Body>,
 }
 /// Nested message and enum types in `ClientFrame`.
@@ -32,6 +35,10 @@ pub mod client_frame {
         Delete(super::Delete),
         #[prost(message, tag = "19")]
         Changed(super::Changed),
+        #[prost(message, tag = "20")]
+        ClaimSlot(super::ClaimSlot),
+        #[prost(message, tag = "21")]
+        DeleteSlot(super::DeleteSlot),
     }
 }
 /// A frame from the server to the client.
@@ -42,7 +49,7 @@ pub struct ServerFrame {
     pub request_id: u64,
     #[prost(
         oneof = "server_frame::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
     )]
     pub body: ::core::option::Option<server_frame::Body>,
 }
@@ -70,6 +77,8 @@ pub mod server_frame {
         Challenge(super::Challenge),
         #[prost(message, tag = "19")]
         Changes(super::Changes),
+        #[prost(message, tag = "20")]
+        Slot(super::Slot),
     }
 }
 /// First frame on a connection. The server answers with a `Challenge`, or with an `Error` if the frame is invalid or
@@ -359,6 +368,38 @@ pub struct Delete {
     #[prost(bool, tag = "2")]
     pub takeover: bool,
 }
+/// Makes the key of this connection the holder of its owner's slot. Answered with `Slot`.
+///
+/// Slots need access tokens: the owner is the token's `sub`. An owner has one slot. The slot's label is taken from a
+/// token claim that the server names in its configuration, e.g. the id of the client's device; without that claim the
+/// label is empty. While the slot is held, opening a database with another key of the same owner fails with
+/// ERROR_CODE_SLOT_TAKEN, also when resuming a lease.
+///
+/// If another key holds the slot, the slot passes to this key, and all databases of the other key are deleted
+/// completely, without the record that `Delete` keeps. Instances that have them open receive `LeaseRevoked` if they
+/// are connected to the same server instance; in any case their next request on them fails with ERROR_CODE_FENCED.
+/// Claiming a slot that this key already holds succeeds and updates the label. A server without access tokens answers
+/// with ERROR_CODE_BAD_REQUEST.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClaimSlot {}
+/// Releases the owner's slot and deletes all databases of the key of this connection completely, without the record
+/// that `Delete` keeps. Answered with `Ok`, also if the owner has no slot. If another key holds the slot, nothing is
+/// deleted and the request fails with ERROR_CODE_SLOT_TAKEN. No database may be open on this connection.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeleteSlot {}
+/// The owner's slot, in answer to `ClaimSlot`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Slot {
+    #[prost(string, tag = "1")]
+    pub label: ::prost::alloc::string::String,
+    /// Time the slot passed to its current key, in milliseconds since the Unix epoch.
+    #[prost(uint64, tag = "2")]
+    pub claimed_at_ms: u64,
+    /// Label of the slot before this claim, if another key held it. Empty if the slot was free or already held by this
+    /// key.
+    #[prost(string, tag = "3")]
+    pub replaced_label: ::prost::alloc::string::String,
+}
 /// Keeps the connection open and renews the leases of all databases open on it. The server renews a lease only if
 /// at least half of lease_ttl_ms has passed since its last renewal. Answered with `Pong`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -455,6 +496,8 @@ pub enum ErrorCode {
     /// The server requires an access token (`Hello.access_token`), and the token is missing, invalid, expired, or bound
     /// to another key.
     AccessDenied = 12,
+    /// Another key holds the owner's slot. See `ClaimSlot`.
+    SlotTaken = 13,
 }
 impl ErrorCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -476,6 +519,7 @@ impl ErrorCode {
             Self::RateLimited => "ERROR_CODE_RATE_LIMITED",
             Self::Internal => "ERROR_CODE_INTERNAL",
             Self::AccessDenied => "ERROR_CODE_ACCESS_DENIED",
+            Self::SlotTaken => "ERROR_CODE_SLOT_TAKEN",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -494,6 +538,7 @@ impl ErrorCode {
             "ERROR_CODE_RATE_LIMITED" => Some(Self::RateLimited),
             "ERROR_CODE_INTERNAL" => Some(Self::Internal),
             "ERROR_CODE_ACCESS_DENIED" => Some(Self::AccessDenied),
+            "ERROR_CODE_SLOT_TAKEN" => Some(Self::SlotTaken),
             _ => None,
         }
     }

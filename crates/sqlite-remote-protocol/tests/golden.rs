@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use prost::Message;
 use sqlite_remote_protocol::v1::{
-    Block, Challenge, Changed, Changes, ClientFrame, CloseDb, Commit, CommitAck, Delete, Error, ErrorCode, Fetch,
-    Hello, HelloOk, LeaseRevoked, Ok, Open, Opened, Pages, Ping, Pong, Proof, Range, Resume, ServerFrame, SigAlg,
-    client_frame, server_frame,
+    Block, Challenge, Changed, Changes, ClaimSlot, ClientFrame, CloseDb, Commit, CommitAck, Delete, DeleteSlot, Error,
+    ErrorCode, Fetch, Hello, HelloOk, LeaseRevoked, Ok, Open, Opened, Pages, Ping, Pong, Proof, Range, Resume,
+    ServerFrame, SigAlg, Slot, client_frame, server_frame,
 };
 
 const DB_ID: &str = "keystore";
@@ -324,6 +324,31 @@ fn samples() -> Vec<(&'static str, Frame)> {
                 C::Delete(Delete {
                     db_id: DB_ID.into(),
                     takeover: true,
+                }),
+            ),
+        ),
+        ("client_claim_slot", client(8, C::ClaimSlot(ClaimSlot {}))),
+        (
+            "server_slot",
+            server(
+                8,
+                S::Slot(Slot {
+                    label: "device-2".into(),
+                    claimed_at_ms: TIME_MS,
+                    replaced_label: "device-1".into(),
+                }),
+            ),
+        ),
+        ("client_delete_slot", client(9, C::DeleteSlot(DeleteSlot {}))),
+        (
+            "server_error_slot_taken",
+            server(
+                3,
+                S::Error(Error {
+                    code: ErrorCode::SlotTaken.into(),
+                    detail: "another key holds the slot".into(),
+                    current_version: 0,
+                    lease_holder_since_ms: 0,
                 }),
             ),
         ),

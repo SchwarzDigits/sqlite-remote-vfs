@@ -1,7 +1,7 @@
 // Protocol between the VFS client and the page server. Each message is one binary WebSocket frame.
 //
-// Covers login, opening a database, fetching blocks, committing, leases and fencing, catching up a local copy, and
-// deleting a database.
+// Covers login, opening a database, fetching blocks, committing, leases and fencing, catching up a local copy,
+// deleting a database, and an owner's slot.
 // Recovery after the server was restored from a backup is not defined yet. Field 14 of `ClientFrame` is reserved
 // for it.
 
@@ -25,6 +25,8 @@ message ClientFrame {
     Proof proof = 17;
     Delete delete = 18;
     Changed changed = 19;
+    ClaimSlot claim_slot = 20;
+    DeleteSlot delete_slot = 21;
   }
 }
 
@@ -44,6 +46,7 @@ message ServerFrame {
     Ok ok = 17;
     Challenge challenge = 18;
     Changes changes = 19;
+    Slot slot = 20;
   }
 }
 
@@ -282,6 +285,35 @@ message Delete {
   bool takeover = 2;
 }
 
+// Makes the key of this connection the holder of its owner's slot. Answered with `Slot`.
+//
+// Slots need access tokens: the owner is the token's `sub`. An owner has one slot. The slot's label is taken from a
+// token claim that the server names in its configuration, e.g. the id of the client's device; without that claim the
+// label is empty. While the slot is held, opening a database with another key of the same owner fails with
+// ERROR_CODE_SLOT_TAKEN, also when resuming a lease.
+//
+// If another key holds the slot, the slot passes to this key, and all databases of the other key are deleted
+// completely, without the record that `Delete` keeps. Instances that have them open receive `LeaseRevoked` if they
+// are connected to the same server instance; in any case their next request on them fails with ERROR_CODE_FENCED.
+// Claiming a slot that this key already holds succeeds and updates the label. A server without access tokens answers
+// with ERROR_CODE_BAD_REQUEST.
+message ClaimSlot {}
+
+// Releases the owner's slot and deletes all databases of the key of this connection completely, without the record
+// that `Delete` keeps. Answered with `Ok`, also if the owner has no slot. If another key holds the slot, nothing is
+// deleted and the request fails with ERROR_CODE_SLOT_TAKEN. No database may be open on this connection.
+message DeleteSlot {}
+
+// The owner's slot, in answer to `ClaimSlot`.
+message Slot {
+  string label = 1;
+  // Time the slot passed to its current key, in milliseconds since the Unix epoch.
+  uint64 claimed_at_ms = 2;
+  // Label of the slot before this claim, if another key held it. Empty if the slot was free or already held by this
+  // key.
+  string replaced_label = 3;
+}
+
 // Keeps the connection open and renews the leases of all databases open on it. The server renews a lease only if
 // at least half of lease_ttl_ms has passed since its last renewal. Answered with `Pong`.
 message Ping {
@@ -341,4 +373,6 @@ enum ErrorCode {
   // The server requires an access token (`Hello.access_token`), and the token is missing, invalid, expired, or bound
   // to another key.
   ERROR_CODE_ACCESS_DENIED = 12;
+  // Another key holds the owner's slot. See `ClaimSlot`.
+  ERROR_CODE_SLOT_TAKEN = 13;
 }
