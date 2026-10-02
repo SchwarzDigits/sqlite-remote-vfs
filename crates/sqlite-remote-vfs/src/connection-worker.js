@@ -11,6 +11,12 @@
 // This worker waits on the REQUEST slot with Atomics.waitAsync, which does not block its event loop. The WebSocket
 // needs that event loop. Browsers without Atomics.waitAsync (e.g. Firefox 140 ESR) poll the slot every millisecond.
 //
+// While the connection is idle, this worker sends Ping frames, so that the server keeps the connection open and renews
+// the leases. It starts once the SQLite worker has logged in and written the ping interval to the PING_MS slot. The
+// answers to these pings are dropped here. Frames the server sends unprompted (request id 0, such as LeaseRevoked) are
+// queued like answers and also posted to the SQLite worker at once, so that it learns of a takeover without making a
+// request. The SQLite worker only receives the message; it never posts one to this worker.
+//
 // Shared memory layout: the control slots, then a request region and an answer region of equal size. This worker only
 // reads the request region and only writes the answer region. A frame from the server can arrive while the SQLite
 // worker is still writing a request, so the two cannot share one region.
@@ -24,6 +30,7 @@ const REQUEST = 4; // set to 1 by the SQLite worker when a request is ready; cle
 const OP = 5; // requested operation (OP_*)
 const REQUEST_LENGTH = 6; // number of request bytes in the request region
 const REACHABLE = 7; // set to 1 when a background connection after OP_PROBE succeeded
+const PING_MS = 8; // ping interval of the logged-in connection in milliseconds; 0 until the SQLite worker logged in
 
 const STATE_OPEN = 1;
 const STATE_FAILED = 2;
@@ -60,6 +67,11 @@ const OP_LOCAL_COMMIT = 13;
 const OP_LOCAL_CLOSE = 14;
 const OP_LOCAL_DELETE = 15;
 
+// Request id of the pings this worker sends. The client counts its request ids up from 1 and never reaches it.
+const PING_ID = 1n << 62n;
+// How often the worker checks whether a ping is due.
+const KEEP_ALIVE_CHECK_MS = 1000;
+
 const encoder = new TextEncoder();
 
 let control = null;
@@ -69,6 +81,8 @@ let url = null;
 let socket = null;
 let closed = false;
 let probing = false;
+// Time of the last frame sent on the connection, by the SQLite worker or as a ping.
+let lastSent = 0;
 
 // Local copy: one IndexedDB database per database name, named copyPrefix + "/" + name, with a "blocks" store keyed
 // by block index and a "head" store. Both are written in one transaction, so the head always matches the blocks.
@@ -146,6 +160,8 @@ function fail(message) {
 function connect() {
   queued = [];
   failure = null;
+  // No pings before the SQLite worker has logged in on the new connection: the server expects Hello first.
+  Atomics.store(control, PING_MS, 0);
   Atomics.store(control, STATE, 0);
   try {
     socket = new WebSocket(url);
@@ -159,11 +175,74 @@ function connect() {
     Atomics.notify(control, STATE);
   };
   socket.onmessage = (event) => {
-    queued.push(new Uint8Array(event.data));
+    const frame = new Uint8Array(event.data);
+    const id = requestId(frame);
+    if (id === PING_ID) {
+      return;
+    }
+    queued.push(frame);
+    if (id === 0n) {
+      self.postMessage({ push: frame });
+    }
     deliver();
   };
   socket.onerror = () => fail("the connection failed");
   socket.onclose = (event) => fail("connection closed: " + event.code + " " + event.reason);
+}
+
+// Sends a Ping if the connection is logged in and nothing was sent for half the ping interval, as the native client
+// does.
+function keepAlive() {
+  if (closed) {
+    return;
+  }
+  const interval = Atomics.load(control, PING_MS);
+  if (interval <= 0 || socket === null || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  const now = Date.now();
+  if (now - lastSent < interval / 2) {
+    return;
+  }
+  try {
+    socket.send(pingFrame(now));
+    lastSent = now;
+  } catch (error) {
+    // The connection is failing. Its close event reports that.
+  }
+}
+
+// Encodes ClientFrame { request_id: PING_ID, ping: Ping { client_time_ms: now } }.
+function pingFrame(now) {
+  const ping = [0x08, ...varint(BigInt(now))]; // Ping field 1, client_time_ms
+  return new Uint8Array([0x08, ...varint(PING_ID), 0x7a, ping.length, ...ping]); // field 1, then field 15 (ping)
+}
+
+function varint(value) {
+  const bytes = [];
+  while (value >= 0x80n) {
+    bytes.push(Number(value & 0x7fn) | 0x80);
+    value >>= 7n;
+  }
+  bytes.push(Number(value));
+  return bytes;
+}
+
+// Returns the request id of a ServerFrame: field 1, which the server writes first, or 0 if it is absent.
+function requestId(frame) {
+  if (frame.length === 0 || frame[0] !== 0x08) {
+    return 0n;
+  }
+  let value = 0n;
+  let shift = 0n;
+  for (let i = 1; i < frame.length && i <= 10; i++) {
+    value |= BigInt(frame[i] & 0x7f) << shift;
+    if ((frame[i] & 0x80) === 0) {
+      return value;
+    }
+    shift += 7n;
+  }
+  return 0n;
 }
 
 // Opens a separate connection and closes it again once it is open. Retries with growing pauses until then.
@@ -210,6 +289,7 @@ function work() {
       try {
         // slice() copies the bytes: WebSocket.send does not accept a view on shared memory.
         socket.send(request.slice(0, Atomics.load(control, REQUEST_LENGTH)));
+        lastSent = Date.now();
         put(KIND_DONE, null);
       } catch (error) {
         put(KIND_ERROR, encoder.encode("send failed: " + error));
@@ -926,6 +1006,7 @@ self.onmessage = (event) => {
   // Without a URL, the VFS keeps its databases only in this browser and there is no connection.
   if (url !== null) {
     connect();
+    setInterval(keepAlive, KEEP_ALIVE_CHECK_MS);
   }
   if (typeof Atomics.waitAsync === "function") {
     serve();

@@ -51,6 +51,10 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
 - **Why a database stopped.** After a failed commit or read, `RemoteVfs::failure()` tells why the open database can
   no longer be used: `TakenOver` (another instance took it over), `Unreachable`, `Denied` (access token),
   `Rejected` or `Full`. Closing and opening the database again resets it.
+- **Takeover without a request.** The server tells the holder of a database when another instance takes it over.
+  `failure()` then returns `TakenOver`, and the function in `Server::on_takeover` is called with the database's name,
+  never during a call from SQLite: in a browser at once, natively within one ping interval. While idle, the client
+  pings the server, so the connection and the leases stay alive; in a browser the connection worker does that.
 - **Healing after an outage.** A database that failed as `Unreachable` heals by itself on the same SQLite
   connection. While the server is gone, every access fails at once; in the background the VFS tries to connect. The
   first access after the server accepted a connection resumes the lease and reloads the database as of the server's

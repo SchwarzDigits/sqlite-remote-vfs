@@ -4,7 +4,8 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
 use sqlite_remote_vfs::{Algorithm, Cache, Config, Failure, Load, Memory, RemoteVfs, Server, Signer, Store};
@@ -134,7 +135,6 @@ fn takeover_sees_commits_and_fences_holder() {
     assert_eq!(count(&second_conn), 50);
 
     // The takeover revoked the first instance's lease, so its next write must fail.
-    assert_eq!(first.failure(), None, "nothing has failed yet");
     let err = first_conn
         .execute("INSERT INTO t (id, payload) VALUES (1000, x'00')", [])
         .unwrap_err();
@@ -148,6 +148,62 @@ fn takeover_sees_commits_and_fences_holder() {
     drop(first_conn);
     drop(second_conn);
     let _again = open(&first, "db", &KEY).unwrap();
+    assert_eq!(first.failure(), None);
+}
+
+#[test]
+fn takeover_is_reported_without_a_request() {
+    let Some(url) = server_url() else { return };
+    let subject = TestSigner::fresh();
+    let reported = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut server = Server::new(&url, subject.clone());
+    let sink = Arc::clone(&reported);
+    server.on_takeover = Some(Arc::new(move |db: &str| sink.lock().unwrap().push(db.to_string())));
+    let holder = register(Config::new(Store::Server(server)));
+    let conn = open(&holder, "db", &KEY).unwrap();
+    conn.execute_batch(CREATE).unwrap();
+
+    let mut config = Config::server(&url, subject.clone());
+    config.takeover = true;
+    let other = register(config);
+    let _other_conn = open(&other, "db", &KEY).unwrap();
+
+    // The holder makes no request. Its ping thread learns of the takeover within one ping interval of the server.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while reported.lock().unwrap().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(*reported.lock().unwrap(), ["db"]);
+    assert_eq!(holder.failure(), Some(Failure::TakenOver));
+}
+
+#[test]
+fn taken_over_database_commits_again_after_taking_it_back() {
+    let Some(url) = server_url() else { return };
+    let subject = TestSigner::fresh();
+    let taking = || {
+        let mut config = Config::server(&url, subject.clone());
+        config.takeover = true;
+        register(config)
+    };
+    let first = taking();
+    let first_conn = open(&first, "db", &KEY).unwrap();
+    first_conn.execute_batch(CREATE).unwrap();
+
+    let second = taking();
+    let second_conn = open(&second, "db", &KEY).unwrap();
+    insert_rows(&second_conn, 0, 1, 10);
+    first_conn
+        .execute("INSERT INTO t (id, payload) VALUES (1000, x'00')", [])
+        .expect_err("taken over");
+    assert_eq!(first.failure(), Some(Failure::TakenOver));
+
+    // The first instance takes the database back on the same VFS. Its earlier revocation does not apply to the new
+    // lease.
+    drop(first_conn);
+    let again = open(&first, "db", &KEY).unwrap();
+    insert_rows(&again, 1, 1, 10);
+    assert_eq!(count(&again), 2);
     assert_eq!(first.failure(), None);
 }
 

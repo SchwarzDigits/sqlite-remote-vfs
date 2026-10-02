@@ -38,6 +38,10 @@ pub(crate) trait Transport: AcrossThreads {
     /// call starts trying to connect in the background, with growing pauses, and returns false. A database that broke
     /// because the server could not be reached tries to recover only when this returns true.
     fn reachable(&mut self) -> bool;
+
+    /// Called after each login with the server's ping interval. In a browser the connection worker then pings while
+    /// the connection is idle. Natively the ping thread does that.
+    fn logged_in(&mut self, _ping_interval: std::time::Duration) {}
 }
 
 /// Pauses between background connection attempts after the server became unreachable: the first, and the longest.
@@ -267,7 +271,7 @@ mod imp {
     //! The connection worker can only be started while the event loop runs, so `start` starts it once, before SQLite
     //! blocks. After that, sending, receiving and reconnecting all go through the shared buffer.
 
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::fmt;
     use std::rc::Rc;
     use std::time::Duration;
@@ -284,7 +288,7 @@ mod imp {
 
     const WORKER: &str = include_str!("connection-worker.js");
 
-    const CONTROL_SLOTS: u32 = 8;
+    const CONTROL_SLOTS: u32 = 9;
     const STATE: u32 = 0;
     const ANSWER: u32 = 1;
     const KIND: u32 = 2;
@@ -293,6 +297,7 @@ mod imp {
     const OP: u32 = 5;
     const REQUEST_LENGTH: u32 = 6;
     const REACHABLE: u32 = 7;
+    const PING_MS: u32 = 8;
 
     const STATE_OPEN: i32 = 1;
     const KIND_FRAME: i32 = 1;
@@ -342,6 +347,23 @@ mod imp {
         seen: Cell<i32>,
         /// Whether the connection worker is trying to connect in the background, after `OP_PROBE`.
         probing: Cell<bool>,
+        /// Receives the frames the server sends unprompted, as soon as the connection worker hands them over.
+        push_handler: Rc<RefCell<Option<PushHandler>>>,
+        /// The worker's message handler that calls `push_handler`. Kept here so that it lives as long as the worker.
+        on_message: RefCell<Option<Closure<dyn FnMut(MessageEvent)>>>,
+    }
+
+    type PushHandler = Box<dyn Fn(&[u8])>;
+
+    /// Sets the receiver of the frames the server sends unprompted, such as `LeaseRevoked`. The connection worker hands
+    /// them over at once; they arrive when the SQLite worker's event loop runs, never during a call from SQLite. They
+    /// also stay in the queue of the connection, where the client reads them at its next request.
+    pub(crate) struct Pushes(Rc<Shared>);
+
+    impl Pushes {
+        pub(crate) fn set_handler(&self, handler: PushHandler) {
+            *self.0.push_handler.borrow_mut() = Some(handler);
+        }
     }
 
     /// Transport over the bridge.
@@ -565,6 +587,11 @@ mod imp {
         fn reopen(&mut self) -> Result<(), String> {
             self.0.ask(OP_REOPEN, 0)?;
             self.0.wait_until_open()
+        }
+
+        fn logged_in(&mut self, ping_interval: Duration) {
+            let millis = i32::try_from(ping_interval.as_millis()).unwrap_or(i32::MAX);
+            let _ = store(&self.0.control, PING_MS, millis);
         }
 
         fn reachable(&mut self) -> bool {
@@ -810,13 +837,16 @@ mod imp {
         /// `LocalBridge`) is dropped. Ending the worker also releases the locks of local databases.
         fn drop(&mut self) {
             let _ = self.ask(OP_CLOSE, 0);
+            self.worker.set_onmessage(None);
             self.worker.terminate();
         }
     }
 
     /// Starts the connection worker and waits until it is ready and the connection is open. Must be awaited before
     /// SQLite blocks, because the worker can only start while the event loop runs.
-    pub(crate) async fn start(config: &ClientConfig) -> Result<(Box<dyn Transport>, Box<dyn LocalStore>), String> {
+    pub(crate) async fn start(
+        config: &ClientConfig,
+    ) -> Result<(Box<dyn Transport>, Box<dyn LocalStore>, Pushes), String> {
         let copy_prefix = format!("sqlite-remote-vfs-cache-{}", crate::subject(&*config.signer));
         let shared = launch(
             &[
@@ -827,7 +857,25 @@ mod imp {
         )
         .await?;
         shared.wait_until_open()?;
-        Ok((Box::new(Bridge(Rc::clone(&shared))), Box::new(Copy(shared))))
+
+        // The connection worker posts {push: Uint8Array} for every frame with request id 0.
+        let handler = Rc::clone(&shared.push_handler);
+        let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            let Ok(frame) = Reflect::get(&event.data(), &"push".into()) else {
+                return;
+            };
+            let Some(frame) = frame.dyn_ref::<Uint8Array>() else {
+                return;
+            };
+            if let Some(handler) = handler.borrow().as_ref() {
+                handler(&frame.to_vec());
+            }
+        });
+        shared.worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        *shared.on_message.borrow_mut() = Some(on_message);
+
+        let pushes = Pushes(Rc::clone(&shared));
+        Ok((Box::new(Bridge(Rc::clone(&shared))), Box::new(Copy(shared)), pushes))
     }
 
     /// Starts the connection worker for local databases named `sqlite-remote-vfs-local/<namespace>/<database>`,
@@ -872,6 +920,8 @@ mod imp {
             timeout,
             seen: Cell::new(0),
             probing: Cell::new(false),
+            push_handler: Rc::default(),
+            on_message: RefCell::new(None),
         }))
     }
 

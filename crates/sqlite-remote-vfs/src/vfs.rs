@@ -542,6 +542,48 @@ fn delete_on_server(data: &AppData, name: &str) -> Result<(), crate::Error> {
     })
 }
 
+/// Reports the takeovers the client has learned of since the last call: if the database open on this VFS was taken
+/// over, sets the failure to `TakenOver` and calls the listener. Takes the locks one after the other, never nested, and
+/// calls the listener without holding any.
+pub(crate) fn report_takeovers(data: &Inner) {
+    let (revoked, listener) = match &data.backend {
+        Backend::Server(server) => (
+            lock(&server.client).take_unreported(),
+            server.settings.on_takeover.clone(),
+        ),
+        #[cfg(target_arch = "wasm32")]
+        Backend::Local(_) => return,
+    };
+    if revoked.is_empty() {
+        return;
+    }
+    let open = lock(&data.files).database.clone();
+    for db_id in revoked {
+        if open.as_deref() != Some(db_id.as_str()) {
+            continue;
+        }
+        *lock(&data.failure) = Some(Failure::TakenOver);
+        if let Some(listener) = &listener {
+            listener.taken_over(&db_id);
+        }
+    }
+}
+
+/// Handles a frame that the connection worker handed over as soon as it arrived. Browser only.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn on_push(data: &Inner, frame: &[u8]) {
+    use prost::Message as _;
+    use sqlite_remote_protocol::v1 as pb;
+
+    let Ok(frame) = pb::ServerFrame::decode(frame) else {
+        return;
+    };
+    if let Some(pb::server_frame::Body::LeaseRevoked(revoked)) = frame.body {
+        lock(&data.server().client).note_revoked(revoked);
+    }
+    report_takeovers(data);
+}
+
 /// Runs `call` on the connection to the server, after reconnecting if it is broken. For requests that concern the
 /// key rather than one database.
 pub(crate) fn with_client<T>(

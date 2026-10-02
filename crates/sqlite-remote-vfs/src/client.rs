@@ -3,7 +3,7 @@
 //! Blocking I/O matches how SQLite calls the VFS: synchronously, and a commit must be stored on the server before the
 //! call returns.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -103,8 +103,11 @@ pub(crate) struct Client {
     limits: Limits,
     next_id: u64,
     last_request: Moment,
-    /// Databases whose lease the server revoked because another instance took it over.
-    revoked: HashSet<String>,
+    /// Databases whose lease the server revoked, with the newest lease epoch it named. A lease with an older epoch is
+    /// revoked; one taken later, with this epoch or a newer one, is not.
+    revoked: HashMap<String, u64>,
+    /// Databases revoked since the last `take_unreported`, for the takeover listener.
+    unreported: Vec<String>,
     /// Time from which the connection counts as broken, so that the next request reconnects with a new access token
     /// before the server closes the connection. `None` without a token.
     token_renewal: Option<Moment>,
@@ -126,7 +129,8 @@ impl Client {
             },
             next_id: 0,
             last_request: Moment::now(),
-            revoked: HashSet::new(),
+            revoked: HashMap::new(),
+            unreported: Vec::new(),
             token_renewal: None,
             trace: config_trace,
         };
@@ -149,7 +153,8 @@ impl Client {
             },
             next_id: 0,
             last_request: Moment::now(),
-            revoked: HashSet::new(),
+            revoked: HashMap::new(),
+            unreported: Vec::new(),
             token_renewal: None,
             trace,
         };
@@ -179,8 +184,26 @@ impl Client {
         self.last_request.elapsed()
     }
 
-    pub fn was_revoked(&self, db_id: &str) -> bool {
-        self.revoked.contains(db_id)
+    /// Whether the server revoked the lease of `db_id` with epoch `lease_epoch`.
+    pub fn was_revoked(&self, db_id: &str, lease_epoch: u64) -> bool {
+        self.revoked.get(db_id).is_some_and(|&newer| newer > lease_epoch)
+    }
+
+    /// Records a `LeaseRevoked` from the server. In a browser the connection worker also hands it over as soon as it
+    /// arrives, so it may be recorded twice; the second time changes nothing.
+    pub fn note_revoked(&mut self, revoked: pb::LeaseRevoked) {
+        let newer = self.revoked.entry(revoked.db_id.clone()).or_insert(0);
+        if revoked.new_lease_epoch > *newer {
+            *newer = revoked.new_lease_epoch;
+            if !self.unreported.contains(&revoked.db_id) {
+                self.unreported.push(revoked.db_id);
+            }
+        }
+    }
+
+    /// Returns the databases revoked since the last call.
+    pub fn take_unreported(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.unreported)
     }
 
     /// Block ranges fetched so far. Empty unless `trace_fetches` is set.
@@ -274,6 +297,9 @@ impl Client {
                 let ttl = Duration::from_millis(ok.access_token_ttl_ms);
                 self.token_renewal =
                     (!ttl.is_zero()).then(|| Moment::now().plus(ttl - TOKEN_RENEWAL_MARGIN.min(ttl / 2)));
+                if let Some(socket) = &mut self.socket {
+                    socket.logged_in(self.limits.ping_interval);
+                }
                 Ok(())
             }
             other => Err(ClientError::Protocol(format!("expected HelloOk, got {other:?}"))),
@@ -491,7 +517,7 @@ impl Client {
                 .map_err(|err| ClientError::Protocol(format!("malformed frame: {err}")))?;
             if frame.request_id == 0 {
                 if let Some(server_frame::Body::LeaseRevoked(revoked)) = frame.body {
-                    self.revoked.insert(revoked.db_id);
+                    self.note_revoked(revoked);
                 }
                 continue;
             }

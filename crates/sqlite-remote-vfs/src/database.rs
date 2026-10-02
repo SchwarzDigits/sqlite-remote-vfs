@@ -230,7 +230,7 @@ impl Database {
         if pages.is_clean() {
             return Ok(());
         }
-        if client.was_revoked(&remote.db_id) {
+        if client.was_revoked(&remote.db_id, remote.lease_epoch) {
             return Err(remote.break_with(Broken::Fenced));
         }
 

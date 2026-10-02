@@ -138,6 +138,9 @@ pub struct Server {
     /// Optional cache on this device. It may be incomplete: blocks it does not have are fetched from the server and
     /// then added to it.
     pub cache: Cache,
+    /// Called when another instance takes over the database open on this VFS, with the database's name. `None` calls
+    /// nothing. See [`TakeoverListener`].
+    pub on_takeover: Option<Arc<dyn TakeoverListener>>,
     /// How long a commit tries to reconnect before it fails. After that the database fails with
     /// [`Failure::Unreachable`] and heals once the server is back, so a short value is enough.
     pub reconnect_timeout: Duration,
@@ -161,11 +164,40 @@ impl Server {
             token: None,
             instance_id: None,
             cache: Cache::None,
+            on_takeover: None,
             reconnect_timeout: Duration::from_secs(10),
             trace_fetches: false,
             #[cfg(not(target_arch = "wasm32"))]
             extra_roots: Vec::new(),
         }
+    }
+}
+
+/// Learns that another instance took over the database open on a VFS: it opened the database with
+/// [`Config::takeover`], or another key claimed the owner's slot ([`RemoteVfs::claim_slot`]). See
+/// [`Server::on_takeover`]. A closure `Fn(&str)` implements it.
+///
+/// The server tells the client right away. In a browser the listener is called as soon as the worker that runs SQLite
+/// is idle; natively the ping thread calls it within one ping interval of the server, 10 s by default. It is never
+/// called during a call from SQLite, so it may close the database. Before the call, [`RemoteVfs::failure`] already
+/// returns [`Failure::TakenOver`], and the next commit fails. It is called once per takeover.
+///
+/// A takeover by another instance on the same server instance is reported at once. If the instances are connected to
+/// different server instances, the client learns of it at its next request, which then fails.
+pub trait TakeoverListener: Shared {
+    /// Called with the name of the database that was taken over.
+    fn taken_over(&self, database: &str);
+}
+
+impl<F: Fn(&str) + Shared> TakeoverListener for F {
+    fn taken_over(&self, database: &str) {
+        self(database)
+    }
+}
+
+impl fmt::Debug for dyn TakeoverListener {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TakeoverListener")
     }
 }
 
@@ -261,7 +293,8 @@ pub struct Stats {
 #[non_exhaustive]
 pub enum Failure {
     /// Another instance has taken the database over, with [`Config::takeover`]: on a server by taking its lease,
-    /// locally by taking its lock.
+    /// locally by taking its lock. On a server also when another key claimed the owner's slot. See
+    /// [`TakeoverListener`] for when a takeover is reported.
     TakenOver,
     /// The server could not be reached within [`Server::reconnect_timeout`], so whether the last commit was stored is
     /// unknown. Locally: the connection worker did not answer within [`Config::timeout`].
@@ -377,12 +410,20 @@ impl RemoteVfs {
                 let settings = settings.clone();
                 let client_config = client_config(&settings, config.timeout);
                 let url = settings.url.clone();
-                let (transport, cache) = crate::transport::start(&client_config)
+                let (transport, cache, pushes) = crate::transport::start(&client_config)
                     .await
                     .map_err(|err| Error::new(format!("{url}: {err}")))?;
                 let client =
                     Client::with_transport(transport, client_config).map_err(|err| Error::client(&url, err))?;
-                Self::finish(name, config, server_backend(settings, client, Some(cache)))
+                let vfs = Self::finish(name, config, server_backend(settings, client, Some(cache)))?;
+                // Weak, because the handler is kept by the connection worker's bridge, which `Inner` owns.
+                let inner = Arc::downgrade(&vfs.inner);
+                pushes.set_handler(Box::new(move |frame| {
+                    if let Some(inner) = inner.upgrade() {
+                        crate::vfs::on_push(&inner, frame);
+                    }
+                }));
+                Ok(vfs)
             }
             Store::Local { namespace } => {
                 if namespace.is_empty() || namespace.contains('/') {
@@ -455,8 +496,9 @@ impl RemoteVfs {
     /// reason. Until then every access to the database fails. After [`Failure::Unreachable`] the database heals by
     /// itself once the server is back, and the value returns to `None`. After any other failure the database must be
     /// closed and opened again, which resets the value. A failure that a retry can overcome, such as a fetch the
-    /// server answered with an error, does not break the database and is not reported here. A takeover is noticed at
-    /// the next commit or at the next block that is not in memory.
+    /// server answered with an error, does not break the database and is not reported here. A takeover on a server is
+    /// reported as described at [`TakeoverListener`], also without a listener; locally it is noticed at the next commit
+    /// or at the next block that is not in memory.
     pub fn failure(&self) -> Option<Failure> {
         *lock(&self.inner.failure)
     }
@@ -561,9 +603,10 @@ fn server_backend(settings: Server, client: Client, cache: Option<Box<dyn crate:
     })
 }
 
-/// Starts a thread that pings the server while SQLite is idle, to keep the connection and the leases alive.
+/// Starts a thread that pings the server while SQLite is idle, to keep the connection and the leases alive, and
+/// reports takeovers.
 ///
-/// Native only. In a browser the connection worker sends the pings.
+/// Native only. In a browser the connection worker sends the pings and hands takeovers over.
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_pinger(inner: Arc<Inner>) {
     use sqlite_remote_protocol::v1 as pb;
@@ -582,6 +625,9 @@ fn spawn_pinger(inner: Arc<Inner>) {
                     // databases.
                     let _ = client.call(pb::client_frame::Body::Ping(pb::Ping { client_time_ms: now }));
                 }
+                drop(client);
+                // Reports the takeovers the ping, or a request of SQLite since the last round, has learned of.
+                crate::vfs::report_takeovers(&inner);
             }
         });
     // If the thread cannot be started, there are no pings. Commits still renew the leases.
