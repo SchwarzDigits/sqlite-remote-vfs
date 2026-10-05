@@ -51,6 +51,12 @@ impl ClientError {
         matches!(self, Self::Server(e) if matches!(e.code(), pb::ErrorCode::Fenced | pb::ErrorCode::SlotTaken))
     }
 
+    /// The server could not complete the request for now, e.g. because its database was unreachable. The request may
+    /// have taken effect.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Server(e) if matches!(e.code(), pb::ErrorCode::Internal | pb::ErrorCode::RateLimited))
+    }
+
     /// Another key holds the slot of the access token's owner.
     pub fn is_slot_taken(&self) -> bool {
         matches!(self, Self::Server(e) if e.code() == pb::ErrorCode::SlotTaken)

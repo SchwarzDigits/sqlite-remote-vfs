@@ -282,7 +282,8 @@ pub struct Stats {
     /// Commits whose acknowledgement was lost and that, according to the server's state after reconnecting, were
     /// applied.
     pub recovered_commits: u64,
-    /// Commits that had not reached the server when the connection broke and were sent again.
+    /// Commits sent again: because they had not reached the server when the connection broke, or because the server
+    /// failed them for now (`ERROR_CODE_INTERNAL` or `ERROR_CODE_RATE_LIMITED`).
     pub resent_commits: u64,
     /// Times the database became usable again after [`Failure::Unreachable`].
     pub healed: u64,
@@ -296,7 +297,8 @@ pub enum Failure {
     /// locally by taking its lock. On a server also when another key claimed the owner's slot. See
     /// [`TakeoverListener`] for when a takeover is reported.
     TakenOver,
-    /// The server could not be reached within [`Server::reconnect_timeout`], so whether the last commit was stored is
+    /// The server could not be reached within [`Server::reconnect_timeout`], or it kept failing the commit for that
+    /// long (`ERROR_CODE_INTERNAL`, e.g. while its database was unreachable), so whether the last commit was stored is
     /// unknown. Locally: the connection worker did not answer within [`Config::timeout`].
     ///
     /// On a server, the database heals by itself. Meanwhile every access fails at once. In the background the VFS

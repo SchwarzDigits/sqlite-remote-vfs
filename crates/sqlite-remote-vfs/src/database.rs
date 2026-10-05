@@ -259,6 +259,18 @@ impl Database {
             match client.commit(parts.clone()) {
                 Ok(version) => break version,
                 Err(err) if err.is_fenced() => return Err(remote.break_with(Broken::Fenced)),
+                Err(err) if err.is_transient() => {
+                    // The server could not complete the commit, e.g. because its database was unreachable. It may
+                    // have taken effect. Sending it again is safe: the server acknowledges a repeated commit id
+                    // without applying it twice.
+                    if Moment::now() >= deadline {
+                        return Err(
+                            remote.break_with(Broken::Uncertain(format!("the server failed the commit: {err}")))
+                        );
+                    }
+                    crate::platform::pause(RECONNECT_PAUSE);
+                    stats.resent_commits += 1;
+                }
                 Err(ClientError::Server(e)) => {
                     return Err(remote.break_with(Broken::Refused(format!(
                         "{}: {}",
@@ -744,9 +756,8 @@ impl Remote {
         let broken = match err {
             err if err.is_fenced() => Broken::Fenced,
             err if err.is_access_denied() => Broken::Denied(err.to_string()),
-            ClientError::Server(e) if !matches!(e.code(), pb::ErrorCode::Internal | pb::ErrorCode::RateLimited) => {
-                Broken::Refused(format!("{}: {}", e.code().as_str_name(), e.detail))
-            }
+            err if err.is_transient() => Broken::Uncertain(format!("the server failed the request: {err}")),
+            ClientError::Server(e) => Broken::Refused(format!("{}: {}", e.code().as_str_name(), e.detail)),
             err => Broken::Uncertain(format!("no connection to the server: {err}")),
         };
         self.break_with(broken)
@@ -772,6 +783,183 @@ fn runs(blocks: &[u64]) -> Vec<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use prost::Message as _;
+    use sqlite_remote_protocol::v1::{self as pb, client_frame, server_frame};
+
+    use super::{Broken, Database, OpenOptions};
+    use crate::client::{Client, ClientConfig};
+    use crate::transport::Transport;
+    use crate::{Algorithm, Signer, Stats};
+
+    const PAGE: u32 = 4096;
+
+    struct NoKey;
+
+    impl Signer for NoKey {
+        fn algorithm(&self) -> Algorithm {
+            Algorithm::Ed25519
+        }
+
+        fn public_key(&self) -> Vec<u8> {
+            vec![7; 32]
+        }
+
+        fn sign(&self, _message: &[u8]) -> Vec<u8> {
+            vec![0; 64]
+        }
+    }
+
+    /// A server that answers in memory. `failures` is the number of commits it answers with ERROR_CODE_INTERNAL
+    /// before it acknowledges one; `commits` records the commit ids it received.
+    struct Scripted {
+        answers: VecDeque<Vec<u8>>,
+        failures: usize,
+        commits: Arc<Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl Scripted {
+        fn answer(&mut self, request_id: u64, body: server_frame::Body) {
+            let frame = pb::ServerFrame {
+                request_id,
+                body: Some(body),
+            };
+            self.answers.push_back(frame.encode_to_vec());
+        }
+    }
+
+    impl Transport for Scripted {
+        fn send(&mut self, frame: Vec<u8>) -> Result<(), String> {
+            let frame = pb::ClientFrame::decode(frame.as_slice()).map_err(|err| err.to_string())?;
+            let id = frame.request_id;
+            match frame.body {
+                Some(client_frame::Body::Hello(_)) => self.answer(
+                    id,
+                    server_frame::Body::Challenge(pb::Challenge {
+                        nonce: vec![1; 32],
+                        server_id: "ws://scripted".into(),
+                        expires_at_ms: u64::MAX,
+                    }),
+                ),
+                Some(client_frame::Body::Proof(_)) => self.answer(
+                    id,
+                    server_frame::Body::HelloOk(pb::HelloOk {
+                        protocol_version: 1,
+                        max_frame_bytes: 1 << 20,
+                        ping_interval_ms: 10_000,
+                        lease_ttl_ms: 300_000,
+                        access_token_ttl_ms: 0,
+                    }),
+                ),
+                Some(client_frame::Body::Open(_)) => self.answer(
+                    id,
+                    server_frame::Body::Opened(pb::Opened {
+                        lease_id: vec![2; 16],
+                        lease_epoch: 1,
+                        version: 0,
+                        page_size: PAGE,
+                        page_count: 0,
+                        last_commit_id: Vec::new(),
+                    }),
+                ),
+                Some(client_frame::Body::Commit(commit)) if !commit.more => {
+                    self.commits.lock().unwrap().push(commit.commit_id.clone());
+                    if self.failures > 0 {
+                        self.failures -= 1;
+                        self.answer(
+                            id,
+                            server_frame::Body::Error(pb::Error {
+                                code: pb::ErrorCode::Internal.into(),
+                                detail: "internal error".into(),
+                                ..Default::default()
+                            }),
+                        );
+                    } else {
+                        self.answer(
+                            id,
+                            server_frame::Body::CommitAck(pb::CommitAck {
+                                commit_id: commit.commit_id,
+                                version: commit.base_version + 1,
+                            }),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn receive(&mut self) -> Result<Vec<u8>, String> {
+            self.answers.pop_front().ok_or_else(|| "nothing to receive".into())
+        }
+
+        fn reopen(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn reachable(&mut self) -> bool {
+            true
+        }
+    }
+
+    /// Opens a database on a scripted server, writes the first page and commits it.
+    fn commit_against(failures: usize, reconnect_timeout: Duration) -> (Result<(), Broken>, Vec<Vec<u8>>, Stats) {
+        let commits = Arc::new(Mutex::new(Vec::new()));
+        let transport = Scripted {
+            answers: VecDeque::new(),
+            failures,
+            commits: Arc::clone(&commits),
+        };
+        let config = ClientConfig {
+            url: "ws://scripted".into(),
+            signer: Arc::new(NoKey),
+            token: None,
+            instance_id: [3; 16],
+            timeout: Duration::from_secs(1),
+            trace_fetches: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            extra_roots: Vec::new(),
+        };
+        let mut client = Client::with_transport(Box::new(transport), config).unwrap();
+        let mut stats = Stats::default();
+        let options = OpenOptions {
+            page_size: PAGE,
+            create: true,
+            takeover: false,
+            blocks_per_fetch: None,
+            cap: None,
+            subject: "subject".into(),
+            local: None,
+        };
+        let mut db = Database::open(&mut client, "db", options, &mut stats).unwrap();
+        db.write(&mut client, &[0xab; PAGE as usize], 0, &mut stats).unwrap();
+        let result = db.commit(&mut client, reconnect_timeout, &mut stats);
+        let sent = commits.lock().unwrap().clone();
+        (result, sent, stats)
+    }
+
+    #[test]
+    fn commit_the_server_failed_is_sent_again() {
+        let (result, sent, stats) = commit_against(2, Duration::from_secs(5));
+        result.expect("the third try is acknowledged");
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|id| *id == sent[0]), "the same commit id every time");
+        assert_eq!(stats.resent_commits, 2);
+    }
+
+    #[test]
+    fn commit_the_server_keeps_failing_is_unreachable_not_rejected() {
+        let (result, sent, _) = commit_against(usize::MAX, Duration::from_millis(500));
+        assert!(
+            matches!(result, Err(Broken::Uncertain(_))),
+            "a healable failure: {result:?}"
+        );
+        assert!(sent.len() >= 2, "tried again until the timeout");
+    }
+
     #[test]
     fn block_list_splits_into_runs() {
         assert_eq!(super::runs(&[]), vec![]);

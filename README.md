@@ -62,6 +62,10 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
   version. With a journal on the VFS (journal mode `DELETE`, SQLite's default, `TRUNCATE` or `PERSIST`), SQLite then
   rolls a commit that failed back, also if it had reached the server. With journal mode `MEMORY` the database keeps
   the server's version, with or without that commit. A takeover during the outage is reported as `TakenOver`.
+- **Server errors during a commit.** If the server fails a commit for now (`ERROR_CODE_INTERNAL`, e.g. while its
+  database is unreachable), the VFS sends the same commit again after a short pause; the server acknowledges a
+  repeated commit without applying it twice. If that does not succeed within `Server::reconnect_timeout`, the
+  database fails as `Unreachable` and heals as above, instead of failing for good.
 - **Cache (optional).** A file natively. In the browser, an IndexedDB database per database, so that several
   databases of one key keep their own caches. Reads are served from it without a round trip. It contains only data
   the server has acknowledged and may be incomplete; missing blocks are fetched from the server. A stale cache is
