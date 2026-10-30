@@ -7,6 +7,9 @@ license.workspace = true
 rust-version.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
 # Encodes the subject (SHA-256 over the public key) as base64url.
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }

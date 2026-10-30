@@ -121,8 +121,8 @@ pub unsafe extern "C" fn sqlite3_sqliteremotevfsext_init(
                 api,
                 error,
                 &format!("sqlite-remote-vfs needs SQLite 3.14.0 or later, found {version}"),
-            )
-        };
+            );
+        }
         return SQLITE_ERROR;
     }
     let previous = API.compare_exchange(
@@ -142,8 +142,8 @@ pub unsafe extern "C" fn sqlite3_sqliteremotevfsext_init(
                 api,
                 error,
                 "sqlite-remote-vfs is already loaded by another SQLite in this process",
-            )
-        };
+            );
+        }
         return SQLITE_ERROR;
     }
     SQLITE_OK_LOAD_PERMANENTLY

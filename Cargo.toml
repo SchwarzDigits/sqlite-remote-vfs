@@ -17,3 +17,16 @@ rust-version = "1.97"
 [patch.crates-io]
 # Vendored libsqlite3-sys with the `bundled-sqlite3mc` feature. See vendor/libsqlite3-sys/sqlite3mc/README.md.
 libsqlite3-sys = { path = "vendor/libsqlite3-sys" }
+
+# A selection of clippy's pedantic lints, applied by every workspace crate through `[lints] workspace = true`. CI runs
+# clippy with `-D warnings`, so each is an error there. The full pedantic group is not used: most of its findings here
+# are casts between page offsets, sizes and times that are intended, and doc comments without backticks.
+[workspace.lints.clippy]
+# A `Result` function's doc comment has an `# Errors` section.
+missing_errors_doc = "warn"
+# A method whose result is the whole point, e.g. a getter, is `#[must_use]`.
+must_use_candidate = "warn"
+# A `match` with a wildcard arm names the variants it stands for, so that a new variant is noticed.
+match_wildcard_for_single_variants = "warn"
+# A unit expression at the end of a block ends with `;`.
+semicolon_if_nothing_returned = "warn"

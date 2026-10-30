@@ -173,17 +173,16 @@ impl MainFile {
     /// accepted a connection since. Otherwise leaves it broken, and the operation fails at once. Called before every
     /// operation on the database file, so that the first access after the server is back succeeds.
     fn heal(&mut self) {
-        match &mut self.db {
-            Db::Server(db) if db.is_unreachable() => {
-                let mut client = lock(&self.inner.server().client);
-                if !client.reachable() {
-                    return;
-                }
-                let healed = db.heal(&mut client, &mut lock(&self.inner.stats));
-                drop(client);
-                *lock(&self.inner.failure) = healed.err().as_ref().map(failure_of);
+        if let Db::Server(db) = &mut self.db
+            && db.is_unreachable()
+        {
+            let mut client = lock(&self.inner.server().client);
+            if !client.reachable() {
+                return;
             }
-            _ => {}
+            let healed = db.heal(&mut client, &mut lock(&self.inner.stats));
+            drop(client);
+            *lock(&self.inner.failure) = healed.err().as_ref().map(failure_of);
         }
     }
 

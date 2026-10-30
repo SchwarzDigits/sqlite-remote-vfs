@@ -7,6 +7,9 @@ rust-version.workspace = true
 description = "C interface to sqlite-remote-vfs, declared in include/sqlite_remote_vfs.h"
 
 # staticlib: for programs that link SQLite themselves. rlib: for sqlite-remote-vfs-ext, the loadable extension.
+[lints]
+workspace = true
+
 [lib]
 crate-type = ["staticlib", "rlib"]
 
