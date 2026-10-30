@@ -176,7 +176,7 @@ jobs:
         with:
           workspaces: browser -> target
       # Must match the wasm-bindgen version in browser/Cargo.lock.
-      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: wasm-bindgen@0.2.128
       - uses: ./.github/actions/start-server
@@ -239,7 +239,7 @@ jobs:
         with:
           workspaces: browser -> target
       # Must match the wasm-bindgen version in browser/Cargo.lock.
-      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: wasm-bindgen@0.2.128
       # The system ar cannot index WebAssembly objects, and the runner's Xcode clang has no WebAssembly target. The
@@ -287,7 +287,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust from rust-toolchain.toml
         run: rustup toolchain install
-      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-deny
       # Licenses, advisories and sources of every dependency, against deny.toml. Each workspace has a lockfile of its
