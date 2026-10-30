@@ -1,0 +1,24 @@
+# Gitleaks allowlist for this repository. The Schwarz Digits compliance workflow runs `gitleaks detect --source .`
+# without a config of its own, so this file extends the default rules. Every entry names a value that only looks
+# like a credential. The keys and tokens in the tests are byte patterns such as `[0x11; 32]`, which match no rule;
+# the two entries below cover the rest. A real secret has no place in this tree.
+
+title = "sqlite-remote-vfs"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Vendored third-party sources and synthetic test values, never credentials"
+regexTarget = "line"
+regexes = [
+  # crates/sqlite-remote-protocol/tests/golden.rs: a token shaped like a JWT, header {"alg":"EdDSA","kid":"k1"},
+  # payload {"sub":"alice"}, signature "signature". The protocol treats the token as an opaque string, the golden
+  # frames only need a fixed value.
+  '''eyJhbGciOiJFZERTQSIsImtpZCI6ImsxIn0\.eyJzdWIiOiJhbGljZSJ9\.c2lnbmF0dXJl''',
+]
+paths = [
+  # Upstream copies of libsqlite3-sys, SQLite and SQLite3 Multiple Ciphers. The generic rule takes identifiers
+  # such as KEYLENGTH_AES128 or sqlite3_api->column_bytes16 for keys.
+  '''^vendor/''',
+]

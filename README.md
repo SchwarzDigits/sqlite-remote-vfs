@@ -294,6 +294,11 @@ CI runs all tests against the server. The native tests and those of the extensio
 Linux, macOS and Windows, the tests against PostgreSQL and with SQLCipher on Linux, and the browser tests in Firefox,
 Chrome, Edge and Safari.
 
+`cargo deny check` checks the licenses, advisories and sources of the dependencies against `deny.toml`. Each of the
+four workspaces has a lockfile of its own, so CI runs it for each: in the root, and with `--manifest-path` for
+`browser`, `extension` and `sqlcipher`. Install it with `cargo install --locked cargo-deny`. The clippy lints that
+apply to every crate are in `[workspace.lints]` in `Cargo.toml`.
+
 ## Harness
 
 Runs against a server that is already running.

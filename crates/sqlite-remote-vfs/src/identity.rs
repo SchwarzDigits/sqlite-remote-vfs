@@ -60,6 +60,10 @@ pub trait TokenSource: Shared {
     /// Returns a valid access token. The VFS calls this before every login, also when it reconnects, and once more
     /// if the server rejects the token. SQLite waits during the call, so it should return a cached token that is
     /// refreshed in advance. The token is opaque to the VFS.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when it has no token. The login then fails with [`crate::Error::is_access_denied`].
     fn token(&self) -> Result<zeroize::Zeroizing<String>, String>;
 }
 

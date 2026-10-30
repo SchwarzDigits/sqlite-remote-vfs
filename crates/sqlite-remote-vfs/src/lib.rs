@@ -191,7 +191,7 @@ pub trait TakeoverListener: Shared {
 
 impl<F: Fn(&str) + Shared> TakeoverListener for F {
     fn taken_over(&self, database: &str) {
-        self(database)
+        self(database);
     }
 }
 
@@ -221,6 +221,7 @@ pub struct Config {
 
 impl Config {
     /// Returns a configuration with the defaults: page size 4096, preload, no memory limit, no takeover, 10 s timeout.
+    #[must_use]
     pub fn new(store: Store) -> Self {
         Config {
             store,
@@ -348,11 +349,13 @@ impl Error {
     }
 
     /// Whether the server rejected the access token, or the [`TokenSource`] returned none.
+    #[must_use]
     pub fn is_access_denied(&self) -> bool {
         self.access_denied
     }
 
     /// Whether another key holds the slot of the access token's owner. See [`RemoteVfs::claim_slot`].
+    #[must_use]
     pub fn is_slot_taken(&self) -> bool {
         self.slot_taken
     }
@@ -387,6 +390,11 @@ pub struct RemoteVfs {
 
 impl RemoteVfs {
     /// Connects to the page server, logs in, and registers the VFS with SQLite under `name`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `name` is not a valid VFS name, if the server cannot be reached, or if it rejects the login, e.g. the
+    /// access token ([`Error::is_access_denied`]).
     pub fn register(name: &str, config: Config) -> Result<Self, Error> {
         check_name(name)?;
         let settings = match &config.store {
@@ -467,17 +475,20 @@ impl RemoteVfs {
     }
 
     /// Name of the VFS in SQLite. SQLite itself does not encrypt; SQLCipher encrypts databases opened with this name.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
     /// Name of the encrypting VFS that SQLite3 Multiple Ciphers creates above this VFS on first use. Works only if
     /// the linked SQLite is SQLite3 Multiple Ciphers.
+    #[must_use]
     pub fn encrypted_name(&self) -> String {
         format!("multipleciphers-{}", self.name)
     }
 
     /// Block ranges fetched from the server so far, in order. Empty unless [`Server::trace_fetches`] is set.
+    #[must_use]
     pub fn fetch_trace(&self) -> Vec<(u64, u64)> {
         match &self.inner.backend {
             Backend::Server(server) => lock(&server.client).fetch_trace(),
@@ -487,6 +498,7 @@ impl RemoteVfs {
     }
 
     /// Returns the current counters.
+    #[must_use]
     pub fn stats(&self) -> Stats {
         *lock(&self.inner.stats)
     }
@@ -500,6 +512,7 @@ impl RemoteVfs {
     /// server answered with an error, does not break the database and is not reported here. A takeover on a server is
     /// reported as described at [`TakeoverListener`], also without a listener; locally it is noticed at the next commit
     /// or at the next block that is not in memory.
+    #[must_use]
     pub fn failure(&self) -> Option<Failure> {
         *lock(&self.inner.failure)
     }
@@ -510,6 +523,11 @@ impl RemoteVfs {
     /// While another instance has it open, deleting fails unless [`Config::takeover`] is set; that instance then can
     /// no longer commit. Deleting a database that does not exist succeeds. Opening `name` again with
     /// `SQLITE_OPEN_CREATE` creates it empty, and it may then use another page size and another key.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the database is open on this VFS, if another instance has it open and [`Config::takeover`] is not
+    /// set, or if the server cannot be reached.
     pub fn delete_database(&self, name: &str) -> Result<(), Error> {
         crate::vfs::delete_database(&self.inner, name)
     }
@@ -522,13 +540,21 @@ impl RemoteVfs {
     /// has one of them open fails with [`Failure::TakenOver`]. The slot then has an empty label until
     /// [`RemoteVfs::set_slot_label`]. Claiming a slot this key already holds changes nothing. Databases of this key
     /// that are open on this VFS stay open.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the server cannot be reached or rejects the request, e.g. a server without access tokens.
     pub fn claim_slot(&self) -> Result<Slot, Error> {
         crate::vfs::with_client(&self.inner, "claiming the slot", Client::claim_slot).map(slot_of)
     }
 
     /// Sets the label of the owner's slot, e.g. the ID of the device that holds it, at most 256 bytes. Only the key
-    /// that holds the slot can set it; for another key it fails with [`Error::is_slot_taken`], and without a slot it
-    /// fails too. It never passes the slot or deletes anything.
+    /// that holds the slot can set it. It never passes the slot or deletes anything.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::is_slot_taken`] if another key holds the slot, and also if this key has no slot, if the
+    /// label is too long, or if the server cannot be reached.
     pub fn set_slot_label(&self, label: &str) -> Result<Slot, Error> {
         crate::vfs::with_client(&self.inner, "setting the slot label", |client| {
             client.set_slot_label(label)
@@ -547,6 +573,11 @@ impl RemoteVfs {
     /// The deletion leaves no record on the server, so do not use this key again: a cache of one of its databases
     /// would be ahead of a new, empty database of the same name, and opening it would fail. The same holds for a key
     /// whose slot another key claimed.
+    ///
+    /// # Errors
+    ///
+    /// Fails with [`Error::is_slot_taken`] if another key holds the slot, and also if a database is open on this VFS
+    /// or if the server cannot be reached.
     pub fn delete_slot(&self) -> Result<(), Error> {
         crate::vfs::delete_slot(&self.inner)
     }
