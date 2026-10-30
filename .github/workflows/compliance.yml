@@ -1,0 +1,25 @@
+# The Schwarz Digits open-source compliance checks: secret scan over the git history (Gitleaks), vulnerability scan
+# (Trivy), license analysis and SBOM (ORT) against the central classifications and rules in
+# SchwarzDigits/oss-compliance. The path excludes come from the .ort.yml the workflow injects; this repository keeps
+# none of its own, as the workflow's onboarding guide asks.
+name: Compliance
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '29 21 * * 0' # weekly, Sunday 21:29 UTC; a unique minute per repository
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compliance:
+    uses: SchwarzDigits/oss-compliance/.github/workflows/full-check.yml@v1
+    with:
+      # The central workflow passes `--scanners Askalono`, a scanner ORT removed before version 96, the `ort:latest`
+      # image the workflow runs. Until oss-compliance catches up, the analysis rests on the licenses the Cargo
+      # manifests declare, which is what cargo-deny verifies on every commit anyway.
+      scanner: disabled
