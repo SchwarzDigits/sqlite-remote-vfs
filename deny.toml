@@ -1,0 +1,67 @@
+# cargo-deny configuration: the licenses, advisories and sources of every dependency.
+#
+# CI runs `cargo deny check` for each of the four workspaces against this file, and it must be green on every commit
+# that lands on main. Locally, from the repository root:
+#
+#   cargo deny check
+#   cargo deny --manifest-path browser/Cargo.toml check
+#   cargo deny --manifest-path extension/Cargo.toml check
+#   cargo deny --manifest-path sqlcipher/Cargo.toml check
+#
+# Install it with `cargo install --locked cargo-deny`.
+
+[graph]
+# No target narrowing: the lockfiles hold the dependencies of the native and the wasm32 builds alike, and all of them
+# are checked.
+all-features = false
+
+[output]
+feature-depth = 1
+
+[licenses]
+# The workspace crates are Apache-2.0 and `publish = false`. They are left out, so that the list below is a pure
+# dependency policy.
+private = { ignore = true }
+# Only permissive licenses. A dependency whose license expression this list does not satisfy blocks the build, also a
+# transitive one. That is how a copyleft dependency shows up before it lands.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+# Crates whose license cannot be detected with at least this confidence from their source tree are rejected.
+confidence-threshold = 0.93
+# Not every license in the list occurs in every workspace. That is no warning.
+unused-allowed-license = "allow"
+
+[advisories]
+version = 2
+# A known vulnerability, an unmaintained crate or a yanked version in the dependency graph blocks the build. An entry
+# in `ignore` is a signed-off exception that names its reason; it is removed with the upgrade that makes it
+# unnecessary.
+yanked = "deny"
+ignore = []
+
+[bans]
+# Several versions of one crate are a warning: transitive dependencies make them unavoidable at times.
+multiple-versions = "warn"
+wildcards = "deny"
+# The path dependencies between the workspace crates are wildcards to cargo-deny.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+# Only crates.io. The vendored libsqlite3-sys is a path dependency through `[patch.crates-io]`.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

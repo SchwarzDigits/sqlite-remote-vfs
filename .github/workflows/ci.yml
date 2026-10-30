@@ -278,3 +278,23 @@ jobs:
         run: sudo safaridriver --enable
       - name: Test in Safari
         run: SAFARIDRIVER=/usr/bin/safaridriver ./test.sh --safari
+
+  dependencies:
+    name: Dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@7623a79cdfecb99d681017af368ca353d9f49bb5 # v2.87.19
+        with:
+          tool: cargo-deny
+      # Licenses, advisories and sources of every dependency, against deny.toml. Each workspace has a lockfile of its
+      # own, so each is checked.
+      - name: cargo deny
+        run: |
+          cargo deny check
+          cargo deny --manifest-path browser/Cargo.toml check
+          cargo deny --manifest-path extension/Cargo.toml check
+          cargo deny --manifest-path sqlcipher/Cargo.toml check
