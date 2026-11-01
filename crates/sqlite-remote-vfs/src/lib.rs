@@ -215,12 +215,19 @@ pub struct Config {
     /// Open a database even if another instance has it open. With a server, the lease is taken over; locally, the
     /// lock is. The other instance can then no longer commit.
     pub takeover: bool,
+    /// Refuse plaintext: fail a read or a write of page 1 that carries an unencrypted SQLite header, so that a
+    /// database is never stored in plaintext by mistake, e.g. when a build linked plain SQLite instead of SQLCipher
+    /// and `PRAGMA key` was silently ignored. SQLite gets `SQLITE_PERM`, a write transaction rolls back, and
+    /// [`RemoteVfs::failure`] reports [`Failure::Plaintext`]. Off by default: with plain SQLite the server stores
+    /// plaintext, see the README.
+    pub refuse_plaintext: bool,
     /// Timeout for connecting and for each response of the server, or of the connection worker in a browser.
     pub timeout: Duration,
 }
 
 impl Config {
-    /// Returns a configuration with the defaults: page size 4096, preload, no memory limit, no takeover, 10 s timeout.
+    /// Returns a configuration with the defaults: page size 4096, preload, no memory limit, no takeover, plaintext
+    /// allowed, 10 s timeout.
     #[must_use]
     pub fn new(store: Store) -> Self {
         Config {
@@ -229,6 +236,7 @@ impl Config {
             load: Load::Preload,
             memory: Memory::Unlimited,
             takeover: false,
+            refuse_plaintext: false,
             timeout: Duration::from_secs(10),
         }
     }
@@ -320,6 +328,10 @@ pub enum Failure {
     Rejected,
     /// Locally: the browser's storage quota is exhausted.
     Full,
+    /// With [`Config::refuse_plaintext`]: page 1 carried an unencrypted SQLite header on a read or a write. The read
+    /// or write was refused with `SQLITE_PERM`; a write transaction rolled back, so the server holds no plaintext
+    /// from it. The SQLite build in use does not encrypt, or the database on the server was stored in plaintext.
+    Plaintext,
 }
 
 /// Error returned when registering a VFS, deleting a database or changing the slot fails.

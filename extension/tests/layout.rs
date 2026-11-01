@@ -36,6 +36,7 @@ fn config_layout_matches_header() {
         offset_of!(Config, extra_roots),
         offset_of!(Config, extra_root_lens),
         offset_of!(Config, extra_roots_count),
+        offset_of!(Config, refuse_plaintext),
     ];
     // SAFETY: plain functions without arguments that need care.
     unsafe {

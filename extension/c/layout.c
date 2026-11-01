@@ -25,6 +25,7 @@ size_t layout_offset(int field) {
     case 14: return offsetof(sqlite_remote_vfs_config, extra_roots);
     case 15: return offsetof(sqlite_remote_vfs_config, extra_root_lens);
     case 16: return offsetof(sqlite_remote_vfs_config, extra_roots_count);
+    case 17: return offsetof(sqlite_remote_vfs_config, refuse_plaintext);
     default: return (size_t)-1;
     }
 }

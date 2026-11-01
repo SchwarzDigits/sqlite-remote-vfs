@@ -61,7 +61,12 @@ pub struct SqliteRemoteVfsConfig {
     pub extra_roots: *const *const u8,
     pub extra_root_lens: *const usize,
     pub extra_roots_count: usize,
+    pub refuse_plaintext: c_int,
 }
+
+/// `struct_size` of a configuration built against the header of version 0.5.0, before `refuse_plaintext`. Such a
+/// configuration is accepted; the field has its default.
+const STRUCT_SIZE_0_5: usize = std::mem::offset_of!(SqliteRemoteVfsConfig, refuse_plaintext);
 
 /// A [`Signer`] that calls the application's sign function.
 struct CallbackSigner {
@@ -148,7 +153,7 @@ unsafe fn bytes(ptr: *const u8, len: usize, what: &str) -> Result<Vec<u8>, Failu
 /// # Safety
 /// All pointers in `c` follow the contract in the header.
 unsafe fn config(c: &SqliteRemoteVfsConfig) -> Result<Config, Failure> {
-    if c.struct_size != size_of::<SqliteRemoteVfsConfig>() {
+    if c.struct_size != size_of::<SqliteRemoteVfsConfig>() && c.struct_size != STRUCT_SIZE_0_5 {
         return Err(misuse("struct_size must be sizeof(sqlite_remote_vfs_config)"));
     }
     // SAFETY: per the header.
@@ -207,6 +212,7 @@ unsafe fn config(c: &SqliteRemoteVfsConfig) -> Result<Config, Failure> {
         config.timeout = Duration::from_millis(c.timeout_ms.into());
     }
     config.takeover = c.takeover != 0;
+    config.refuse_plaintext = c.refuse_plaintext != 0;
     Ok(config)
 }
 
@@ -220,8 +226,22 @@ unsafe fn register(name: *const c_char, config_ptr: *const SqliteRemoteVfsConfig
     if config_ptr.is_null() {
         return Err(misuse("config is NULL"));
     }
-    // SAFETY: not NULL, and points to a config per the header.
-    let config = unsafe { config(&*config_ptr) }?;
+    // The caller's struct may be the shorter one of version 0.5.0, so it is not referenced as a whole. Its
+    // `struct_size` bytes are copied into a zeroed struct: every field is an integer, a pointer or an `Option` of a
+    // function pointer, for which zero is a valid value and the default.
+    // SAFETY: not NULL, and `struct_size` is the first field of every version of the struct.
+    let size = unsafe { std::ptr::addr_of!((*config_ptr).struct_size).read_unaligned() };
+    if size != size_of::<SqliteRemoteVfsConfig>() && size != STRUCT_SIZE_0_5 {
+        return Err(misuse("struct_size must be sizeof(sqlite_remote_vfs_config)"));
+    }
+    let mut full = std::mem::MaybeUninit::<SqliteRemoteVfsConfig>::zeroed();
+    // SAFETY: the caller's struct has `size` readable bytes per the header, and `full` has room for them.
+    let c = unsafe {
+        std::ptr::copy_nonoverlapping(config_ptr.cast::<u8>(), full.as_mut_ptr().cast::<u8>(), size);
+        full.assume_init()
+    };
+    // SAFETY: points to a config per the header.
+    let config = unsafe { config(&c) }?;
     let vfs = RemoteVfs::register(&name, config).map_err(|err| Failure(SQLITE_ERROR, err.to_string()))?;
     // The VFS stays registered for the life of the process, so its handle, and with it the ping thread, is kept.
     REGISTERED

@@ -86,6 +86,29 @@ fn io_error(code: VfsErrorCode, message: impl Into<String>) -> VfsError {
     VfsError::new(code, message.into().into())
 }
 
+/// The error SQLite gets for a failed read or write: `SQLITE_PERM` for refused plaintext, otherwise `code`.
+fn broken_error(broken: &Broken, code: VfsErrorCode) -> VfsError {
+    match broken {
+        Broken::Plaintext => io_error(
+            VfsErrorCode::Permission,
+            "plaintext refused: page 1 carries an unencrypted SQLite header, see Config::refuse_plaintext",
+        ),
+        other => io_error(code, format!("{other:?}")),
+    }
+}
+
+/// Whether `page` starts with an unencrypted SQLite file header: the magic string, the fixed bytes 21 to 23 and the
+/// 20 reserved bytes from 72 on, which are zero. Encryption above the VFS leaves none of these intact: SQLCipher and
+/// SQLite3 Multiple Ciphers replace the magic string with a salt or encrypt from byte 24 on at the latest. Only a
+/// plaintext header (`cipher_plaintext_header_size`) of 96 bytes or more would pass as plaintext, which is nothing
+/// a database that is meant to be encrypted uses.
+fn plaintext_header(page: &[u8]) -> bool {
+    page.len() >= 92
+        && page.starts_with(b"SQLite format 3\0")
+        && page[21..24] == [64, 32, 32]
+        && page[72..92].iter().all(|&byte| byte == 0)
+}
+
 // -------------------------------------------------------------------------------------------------------------------
 // Files
 // -------------------------------------------------------------------------------------------------------------------
@@ -141,10 +164,17 @@ impl MainFile {
             #[cfg(target_arch = "wasm32")]
             Db::Local(db) => db.read(buf, offset, &mut lock(&self.inner.stats)),
         };
+        if result.is_ok() && offset == 0 && self.refuses_plaintext(buf) {
+            return Err(Broken::Plaintext);
+        }
         self.record(result)
     }
 
     fn write(&mut self, data: &[u8], offset: u64) -> Result<(), Broken> {
+        // Before the write reaches the blocks in memory, so that a commit cannot send it.
+        if offset == 0 && self.refuses_plaintext(data) {
+            return Err(Broken::Plaintext);
+        }
         self.heal();
         let result = match &mut self.db {
             Db::Server(db) => db.write(
@@ -186,6 +216,17 @@ impl MainFile {
         }
     }
 
+    /// With [`Config::refuse_plaintext`], whether `page1` carries an unencrypted SQLite header. If so, the failure
+    /// is recorded for [`RemoteVfs::failure`]. The page is page 1 whenever the offset is 0: SQLite reads its header
+    /// and writes it as a whole page.
+    fn refuses_plaintext(&self, page1: &[u8]) -> bool {
+        let refused = self.inner.config.refuse_plaintext && plaintext_header(page1);
+        if refused {
+            *lock(&self.inner.failure) = Some(Failure::Plaintext);
+        }
+        refused
+    }
+
     /// Records why the database broke, if the operation that returned `result` broke it.
     fn record<T>(&self, result: Result<T, Broken>) -> Result<T, Broken> {
         if result.is_err() {
@@ -216,7 +257,7 @@ impl VfsFile for RemoteFile {
             RemoteFile::Main(main) => {
                 let full = main
                     .read(buf, offset)
-                    .map_err(|broken| io_error(VfsErrorCode::IoRead, format!("{broken:?}")))?;
+                    .map_err(|broken| broken_error(&broken, VfsErrorCode::IoRead))?;
                 if full {
                     return Ok(buf.len());
                 }
@@ -232,7 +273,7 @@ impl VfsFile for RemoteFile {
         match self {
             RemoteFile::Main(main) => main
                 .write(buf, offset)
-                .map_err(|broken| io_error(VfsErrorCode::IoWrite, format!("{broken:?}"))),
+                .map_err(|broken| broken_error(&broken, VfsErrorCode::IoWrite)),
             RemoteFile::Temp(temp) => lock(temp).write(buf, offset),
         }
     }
@@ -640,6 +681,7 @@ fn failure_of(broken: &Broken) -> Failure {
         Broken::Diverged(_) | Broken::Refused(_) => Failure::Rejected,
         #[cfg(target_arch = "wasm32")]
         Broken::Full(_) => Failure::Full,
+        Broken::Plaintext => Failure::Plaintext,
     }
 }
 
@@ -723,6 +765,66 @@ mod tests {
         assert_eq!(failure_of(&Broken::Uncertain("gone".into())), Failure::Unreachable);
         assert_eq!(failure_of(&Broken::Denied("token".into())), Failure::Denied);
         assert_eq!(failure_of(&Broken::Diverged("version".into())), Failure::Rejected);
+        assert_eq!(failure_of(&Broken::Plaintext), Failure::Plaintext);
         assert_eq!(failure_of(&Broken::Refused("too large".into())), Failure::Rejected);
+    }
+
+    /// Page 1 of an empty plain SQLite database with 4096-byte pages, as SQLite writes it.
+    fn plain_page1() -> Vec<u8> {
+        let mut page = vec![0u8; 4096];
+        page[..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&4096u16.to_be_bytes());
+        page[18] = 1; // write version
+        page[19] = 1; // read version
+        page[21..24].copy_from_slice(&[64, 32, 32]);
+        page[28..32].copy_from_slice(&1u32.to_be_bytes()); // page count
+        page[47] = 4; // schema format
+        page[59] = 1; // text encoding
+        page[96..100].copy_from_slice(&3_050_000u32.to_be_bytes());
+        page
+    }
+
+    #[test]
+    fn plain_header_is_detected() {
+        let page = plain_page1();
+        assert!(plaintext_header(&page));
+        assert!(plaintext_header(&page[..100]), "the 100-byte header read at open");
+        assert!(!plaintext_header(&page[..91]), "too short to tell");
+    }
+
+    #[test]
+    fn encrypted_headers_are_not_plaintext() {
+        // SQLCipher and SQLite3 Multiple Ciphers with their default ciphers: a salt instead of the magic string.
+        let mut salted = plain_page1();
+        salted[..16].copy_from_slice(&[0x9a; 16]);
+        assert!(!plaintext_header(&salted));
+
+        // A cipher that keeps the first 24 bytes and encrypts the rest, as SQLite3 Multiple Ciphers' ChaCha20 does
+        // from byte 24 on: the reserved bytes are not zero.
+        let mut from_24 = plain_page1();
+        for (index, byte) in from_24[24..].iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        assert!(!plaintext_header(&from_24));
+
+        // A plaintext header of 32 bytes (`cipher_plaintext_header_size`): the reserved bytes are encrypted.
+        let mut header_32 = from_24.clone();
+        header_32[..32].copy_from_slice(&plain_page1()[..32]);
+        assert!(!plaintext_header(&header_32));
+
+        // Fully encrypted, including the magic string.
+        let mut all = plain_page1();
+        for (index, byte) in all.iter_mut().enumerate() {
+            *byte = (index as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        assert!(!plaintext_header(&all));
+    }
+
+    #[test]
+    fn other_pages_and_zero_pages_are_not_plaintext() {
+        assert!(!plaintext_header(&[0u8; 4096]), "a page that was never written");
+        let mut page2 = vec![0u8; 4096];
+        page2[0] = 13; // a leaf table b-tree page
+        assert!(!plaintext_header(&page2));
     }
 }

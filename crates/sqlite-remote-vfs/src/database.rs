@@ -38,6 +38,9 @@ pub(crate) enum Broken {
     /// Locally: the browser's storage quota is exhausted. SQLite gets `SQLITE_FULL`.
     #[cfg(target_arch = "wasm32")]
     Full(String),
+    /// With [`Config::refuse_plaintext`](crate::Config::refuse_plaintext): page 1 carried an unencrypted SQLite
+    /// header. Only that read or write is refused, with `SQLITE_PERM`; the database itself is not broken.
+    Plaintext,
 }
 
 pub(crate) struct Database {
