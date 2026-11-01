@@ -141,5 +141,9 @@ fn plaintext_is_refused_when_configured() {
     let err = conn
         .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
         .expect_err("plain SQLite must not store page 1");
-    assert_eq!(err.sqlite_error_code(), Some(rusqlite::ErrorCode::PermissionDenied), "{err}");
+    assert_eq!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::PermissionDenied),
+        "{err}"
+    );
 }

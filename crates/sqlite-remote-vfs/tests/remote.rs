@@ -1355,11 +1355,13 @@ fn refused_plaintext_fails_the_read_of_a_database_stored_in_plaintext() {
     conn.execute_batch(CREATE).unwrap();
     drop(conn);
 
-    // The same subject with a VFS that refuses plaintext: the header read fails.
+    // The same subject with a VFS that refuses plaintext: the first statement reads the header and fails. Opened
+    // without the journal mode pragma of `open_unencrypted`, which would already be that statement.
     let mut config = Config::server(url, signer);
     config.refuse_plaintext = true;
     let refusing = register(config);
-    let conn = open_unencrypted(&refusing, "db").unwrap();
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags_and_vfs("db", flags, refusing.name()).unwrap();
     let err = conn
         .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0))
         .expect_err("a plaintext header must not be read");
