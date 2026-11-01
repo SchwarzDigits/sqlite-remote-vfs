@@ -225,6 +225,7 @@ mod file {
     use std::path::{Path, PathBuf};
 
     use super::{Head, LocalStore};
+    use crate::pages::{MAX_PAGE_COUNT, MAX_PAGE_SIZE};
 
     const MAGIC: &[u8; 8] = b"rvfslcl2";
     /// Size of the header at the start of the file. Blocks start at this offset.
@@ -464,6 +465,12 @@ mod file {
         let state = bytes[8];
         let page_size = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
         let page_count = u64::from_le_bytes(bytes[16..24].try_into().ok()?);
+        // The header has no checksum. These two values size the bitmap and place the blocks, so a damaged header
+        // with values SQLite never produces is not trusted. The page size is only bounded: the open database's
+        // page size, checked when the copy is used, decides whether the copy fits.
+        if page_size == 0 || page_size > MAX_PAGE_SIZE || page_count > MAX_PAGE_COUNT {
+            return None;
+        }
         let version = u64::from_le_bytes(bytes[24..32].try_into().ok()?);
         let subject_len = u16::from_le_bytes(bytes[32..34].try_into().ok()?) as usize;
         let db_id_len = u16::from_le_bytes(bytes[34..36].try_into().ok()?) as usize;
@@ -613,6 +620,35 @@ mod tests {
             "a head in the writing state is not trusted"
         );
         assert!(store.read(0, 1).unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn damaged_header_is_untrusted() {
+        let (mut store, path) = store("damaged");
+        store.write(&head(1, 1), &[(0, &[1u8; 8])]).unwrap();
+        let written = std::fs::read(&path).unwrap();
+
+        // A page count beyond SQLite's limit would size the bitmap, see `decode`.
+        let mut bytes = written.clone();
+        bytes[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(FileStore::new(&path).head().unwrap(), None, "page count");
+
+        // A page size of zero, or one SQLite never produces.
+        for page_size in [0u32, 1 << 17] {
+            let mut bytes = written.clone();
+            bytes[12..16].copy_from_slice(&page_size.to_le_bytes());
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(FileStore::new(&path).head().unwrap(), None, "page size {page_size}");
+        }
+
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(
+            FileStore::new(&path).head().unwrap(),
+            Some(head(1, 1)),
+            "the undamaged header"
+        );
         let _ = std::fs::remove_file(path);
     }
 

@@ -8,7 +8,7 @@ use sqlite_remote_protocol::v1::{self as pb, client_frame, server_frame};
 use crate::Stats;
 use crate::client::{Client, ClientError};
 use crate::local::{Head, LocalCopy, LocalStore};
-use crate::pages::{Pages, Source};
+use crate::pages::{MAX_PAGE_COUNT, Pages, Source, valid_page_size};
 use crate::platform::Moment;
 
 const COMMIT_ID_BYTES: usize = 16;
@@ -100,6 +100,7 @@ impl Database {
         let server_frame::Body::Opened(opened) = answer else {
             return Err(ClientError::Protocol(format!("expected Opened, got {answer:?}")));
         };
+        let opened = checked(opened, None)?;
         let mut pages = Pages::new(
             opened.page_size as usize,
             opened.page_count,
@@ -743,6 +744,7 @@ impl Remote {
         }))?;
         match answer {
             server_frame::Body::Opened(opened) => {
+                let opened = checked(opened, Some(page_size as u32))?;
                 self.login = client.logins();
                 Ok(opened)
             }
@@ -769,6 +771,34 @@ impl Remote {
     }
 }
 
+/// Checks the values of an `Opened` answer before they size anything. The page size must be one SQLite allows and,
+/// for a resumed database, the one in use; the page count must not exceed SQLite's limit. A server that sends other
+/// values is not followed: a page size of 0 would divide by zero in [`Pages`], a huge one would allocate blocks of
+/// that size, and a huge page count would size the bitmap of the local copy.
+fn checked(opened: pb::Opened, in_use: Option<u32>) -> Result<pb::Opened, ClientError> {
+    if !valid_page_size(opened.page_size) {
+        return Err(ClientError::Protocol(format!(
+            "page size {} is not one SQLite allows",
+            opened.page_size
+        )));
+    }
+    if let Some(page_size) = in_use
+        && opened.page_size != page_size
+    {
+        return Err(ClientError::Protocol(format!(
+            "page size {} differs from the open database's {page_size}",
+            opened.page_size
+        )));
+    }
+    if opened.page_count > MAX_PAGE_COUNT {
+        return Err(ClientError::Protocol(format!(
+            "page count {} exceeds SQLite's limit of {MAX_PAGE_COUNT}",
+            opened.page_count
+        )));
+    }
+    Ok(opened)
+}
+
 /// Groups a sorted list of block indexes into runs of consecutive indexes, as `(first, count)`.
 fn runs(blocks: &[u64]) -> Vec<(u64, u64)> {
     let mut runs: Vec<(u64, u64)> = Vec::new();
@@ -791,7 +821,8 @@ mod tests {
     use sqlite_remote_protocol::v1::{self as pb, client_frame, server_frame};
 
     use super::{Broken, Database, OpenOptions};
-    use crate::client::{Client, ClientConfig};
+    use crate::client::{Client, ClientConfig, ClientError};
+    use crate::pages::MAX_PAGE_COUNT;
     use crate::transport::Transport;
     use crate::{Algorithm, Signer, Stats};
 
@@ -819,6 +850,9 @@ mod tests {
         answers: VecDeque<Vec<u8>>,
         failures: usize,
         commits: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// What the server claims in `Opened`.
+        page_size: u32,
+        page_count: u64,
     }
 
     impl Scripted {
@@ -860,8 +894,8 @@ mod tests {
                         lease_id: vec![2; 16],
                         lease_epoch: 1,
                         version: 0,
-                        page_size: PAGE,
-                        page_count: 0,
+                        page_size: self.page_size,
+                        page_count: self.page_count,
                         last_commit_id: Vec::new(),
                     }),
                 ),
@@ -906,12 +940,16 @@ mod tests {
     }
 
     /// Opens a database on a scripted server, writes the first page and commits it.
-    fn commit_against(failures: usize, reconnect_timeout: Duration) -> (Result<(), Broken>, Vec<Vec<u8>>, Stats) {
+    /// A client on a scripted server that fails the first `failures` commits and reports the given page size and
+    /// page count. Returns the client and the commit ids the server received.
+    fn scripted(failures: usize, page_size: u32, page_count: u64) -> (Client, Arc<Mutex<Vec<Vec<u8>>>>) {
         let commits = Arc::new(Mutex::new(Vec::new()));
         let transport = Scripted {
             answers: VecDeque::new(),
             failures,
             commits: Arc::clone(&commits),
+            page_size,
+            page_count,
         };
         let config = ClientConfig {
             url: "ws://scripted".into(),
@@ -923,18 +961,26 @@ mod tests {
             #[cfg(not(target_arch = "wasm32"))]
             extra_roots: Vec::new(),
         };
-        let mut client = Client::with_transport(Box::new(transport), config).unwrap();
-        let mut stats = Stats::default();
-        let options = OpenOptions {
+        let client = Client::with_transport(Box::new(transport), config).unwrap();
+        (client, commits)
+    }
+
+    fn options(blocks_per_fetch: Option<u64>) -> OpenOptions {
+        OpenOptions {
             page_size: PAGE,
             create: true,
             takeover: false,
-            blocks_per_fetch: None,
+            blocks_per_fetch,
             cap: None,
             subject: "subject".into(),
             local: None,
-        };
-        let mut db = Database::open(&mut client, "db", options, &mut stats).unwrap();
+        }
+    }
+
+    fn commit_against(failures: usize, reconnect_timeout: Duration) -> (Result<(), Broken>, Vec<Vec<u8>>, Stats) {
+        let (mut client, commits) = scripted(failures, PAGE, 0);
+        let mut stats = Stats::default();
+        let mut db = Database::open(&mut client, "db", options(None), &mut stats).unwrap();
         db.write(&mut client, &[0xab; PAGE as usize], 0, &mut stats).unwrap();
         let result = db.commit(&mut client, reconnect_timeout, &mut stats);
         let sent = commits.lock().unwrap().clone();
@@ -958,6 +1004,40 @@ mod tests {
             "a healable failure: {result:?}"
         );
         assert!(sent.len() >= 2, "tried again until the timeout");
+    }
+
+    #[test]
+    fn opened_with_a_page_size_sqlite_does_not_allow_is_refused() {
+        // 0 would divide by zero in the page store, a huge value would allocate blocks of that size.
+        for page_size in [0, 100, 3000, 1 << 17, u32::MAX] {
+            let (mut client, _) = scripted(0, page_size, 0);
+            let err = Database::open(&mut client, "db", options(None), &mut Stats::default())
+                .err()
+                .unwrap_or_else(|| panic!("page size {page_size} must be refused"));
+            assert!(matches!(err, ClientError::Protocol(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn opened_with_a_page_count_beyond_sqlites_limit_is_refused() {
+        // The page count sizes the bitmap of the local copy.
+        for page_count in [MAX_PAGE_COUNT + 1, u64::MAX] {
+            let (mut client, _) = scripted(0, PAGE, page_count);
+            let err = Database::open(&mut client, "db", options(Some(1)), &mut Stats::default())
+                .err()
+                .unwrap_or_else(|| panic!("page count {page_count} must be refused"));
+            assert!(matches!(err, ClientError::Protocol(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn opened_at_sqlites_limits_is_accepted() {
+        // On demand, so that the open does not load a database of the largest page count.
+        for (page_size, page_count) in [(512, 0), (65536, 0), (PAGE, MAX_PAGE_COUNT)] {
+            let (mut client, _) = scripted(0, page_size, page_count);
+            Database::open(&mut client, "db", options(Some(1)), &mut Stats::default())
+                .unwrap_or_else(|err| panic!("page size {page_size}, page count {page_count}: {err:?}"));
+        }
     }
 
     #[test]

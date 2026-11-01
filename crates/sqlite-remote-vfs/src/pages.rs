@@ -11,6 +11,18 @@ use crate::database::Broken;
 /// `Load::OnDemand`, the configured `blocks_per_fetch` is used instead.
 const REFILL_BLOCKS: u64 = 64;
 
+/// Smallest page size SQLite allows.
+pub(crate) const MIN_PAGE_SIZE: u32 = 512;
+/// Largest page size SQLite allows.
+pub(crate) const MAX_PAGE_SIZE: u32 = 65536;
+/// Largest number of pages in a database file, SQLite's `SQLITE_MAX_PAGE_COUNT`.
+pub(crate) const MAX_PAGE_COUNT: u64 = 4_294_967_294;
+
+/// Whether SQLite allows the page size: a power of two from [`MIN_PAGE_SIZE`] to [`MAX_PAGE_SIZE`].
+pub(crate) fn valid_page_size(size: u32) -> bool {
+    (MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&size) && size.is_power_of_two()
+}
+
 /// A block in memory. `used` is the value of the LRU clock at its last access.
 struct Block {
     data: Vec<u8>,
