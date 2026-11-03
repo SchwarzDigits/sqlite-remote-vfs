@@ -392,17 +392,19 @@ impl Client {
         }
     }
 
-    /// Fetches a range of blocks. The server may split the response across several frames.
-    pub fn fetch(&mut self, fetch: pb::Fetch) -> Result<Vec<Vec<u8>>, ClientError> {
+    /// Fetches a range of blocks of `block_size` bytes each. The server may split the response across several
+    /// frames.
+    pub fn fetch(&mut self, fetch: pb::Fetch, block_size: usize) -> Result<Vec<Vec<u8>>, ClientError> {
         let expected = fetch.count;
         if let Some(trace) = &mut self.trace {
             trace.push((fetch.first_block, fetch.count));
         }
-        let blocks = self.fetch_frames(fetch, expected)?;
+        let blocks = self.fetch_frames(fetch, expected, block_size)?;
         Ok(blocks.into_iter().map(|(_, data)| data).collect())
     }
 
-    /// Fetches several block ranges in one request and returns each block with its index.
+    /// Fetches several block ranges of blocks of `block_size` bytes in one request and returns each block with its
+    /// index.
     ///
     /// Used to catch up an outdated local copy. The blocks changed by recent commits are spread across the file, and
     /// one request per range would cost one round trip each.
@@ -411,6 +413,7 @@ impl Client {
         db_id: &str,
         version: u64,
         ranges: &[(u64, u64)],
+        block_size: usize,
     ) -> Result<Vec<(u64, Vec<u8>)>, ClientError> {
         if let Some(trace) = &mut self.trace {
             trace.extend(ranges.iter().copied());
@@ -428,12 +431,21 @@ impl Client {
                     .collect(),
             },
             expected,
+            block_size,
         )
     }
 
     /// Reads the response frames of one fetch and pairs each block with its index. Each frame carries the index of
     /// its first block, and no frame spans two ranges, so every block's index follows from its frame.
-    fn fetch_frames(&mut self, fetch: pb::Fetch, expected: u64) -> Result<Vec<(u64, Vec<u8>)>, ClientError> {
+    ///
+    /// Every block must have `block_size` bytes. The page store slices blocks by the page size, so a shorter one
+    /// would panic at the first read inside a VFS callback, and a longer one would be committed back as it is.
+    fn fetch_frames(
+        &mut self,
+        fetch: pb::Fetch,
+        expected: u64,
+        block_size: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, ClientError> {
         let id = self.send(client_frame::Body::Fetch(fetch))?;
         let mut blocks = Vec::new();
         loop {
@@ -443,6 +455,12 @@ impl Client {
             }
             match frame.body {
                 Some(server_frame::Body::Pages(pages)) => {
+                    if let Some(data) = pages.blocks.iter().find(|data| data.len() != block_size) {
+                        return Err(ClientError::Protocol(format!(
+                            "block of {} bytes, expected {block_size}",
+                            data.len()
+                        )));
+                    }
                     for (offset, data) in pages.blocks.into_iter().enumerate() {
                         blocks.push((pages.first_block + offset as u64, data));
                     }

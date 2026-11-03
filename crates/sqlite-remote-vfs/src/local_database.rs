@@ -182,6 +182,14 @@ impl Source for Load<'_> {
                 }
                 other => Broken::Refused(other.to_string()),
             })?;
+            // The page store slices blocks by the page size. A stored block of another size is not followed.
+            if let Some(data) = blocks.iter().find(|data| data.len() != pages.page_size()) {
+                return Err(Broken::Refused(format!(
+                    "stored block of {} bytes, expected {}",
+                    data.len(),
+                    pages.page_size()
+                )));
+            }
             stats.local_reads += 1;
             stats.local_blocks_read += n;
             for (offset, data) in blocks.into_iter().enumerate() {

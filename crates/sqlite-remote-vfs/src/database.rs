@@ -520,7 +520,7 @@ impl Remote {
         // in a single request with one range per run instead of one round trip per run.
         if !pages.on_demand() && !runs.is_empty() {
             let started = Moment::now();
-            let blocks = client.fetch_ranges(&self.db_id, self.version, &runs)?;
+            let blocks = client.fetch_ranges(&self.db_id, self.version, &runs, pages.page_size())?;
             stats.fetches += 1;
             stats.fetched_blocks += blocks.len() as u64;
             stats.fetch_time += started.elapsed();
@@ -680,13 +680,16 @@ impl Remote {
         stats: &mut Stats,
     ) -> Result<(), ClientError> {
         let started = Moment::now();
-        let blocks = client.fetch(pb::Fetch {
-            db_id: self.db_id.clone(),
-            version: self.version,
-            first_block: first,
-            count,
-            ranges: Vec::new(),
-        })?;
+        let blocks = client.fetch(
+            pb::Fetch {
+                db_id: self.db_id.clone(),
+                version: self.version,
+                first_block: first,
+                count,
+                ranges: Vec::new(),
+            },
+            pages.page_size(),
+        )?;
         stats.fetches += 1;
         stats.fetched_blocks += count;
         stats.fetch_time += started.elapsed();
@@ -853,6 +856,8 @@ mod tests {
         /// What the server claims in `Opened`.
         page_size: u32,
         page_count: u64,
+        /// Size of the blocks it sends on a fetch.
+        block_size: usize,
     }
 
     impl Scripted {
@@ -899,6 +904,14 @@ mod tests {
                         last_commit_id: Vec::new(),
                     }),
                 ),
+                Some(client_frame::Body::Fetch(fetch)) => self.answer(
+                    id,
+                    server_frame::Body::Pages(pb::Pages {
+                        first_block: fetch.first_block,
+                        blocks: (0..fetch.count).map(|_| vec![0x5a; self.block_size]).collect(),
+                        last: true,
+                    }),
+                ),
                 Some(client_frame::Body::Commit(commit)) if !commit.more => {
                     self.commits.lock().unwrap().push(commit.commit_id.clone());
                     if self.failures > 0 {
@@ -943,6 +956,16 @@ mod tests {
     /// A client on a scripted server that fails the first `failures` commits and reports the given page size and
     /// page count. Returns the client and the commit ids the server received.
     fn scripted(failures: usize, page_size: u32, page_count: u64) -> (Client, Arc<Mutex<Vec<Vec<u8>>>>) {
+        scripted_sending(failures, page_size, page_count, page_size as usize)
+    }
+
+    /// As [`scripted`], with a server that sends blocks of `block_size` bytes on a fetch.
+    fn scripted_sending(
+        failures: usize,
+        page_size: u32,
+        page_count: u64,
+        block_size: usize,
+    ) -> (Client, Arc<Mutex<Vec<Vec<u8>>>>) {
         let commits = Arc::new(Mutex::new(Vec::new()));
         let transport = Scripted {
             answers: VecDeque::new(),
@@ -950,6 +973,7 @@ mod tests {
             commits: Arc::clone(&commits),
             page_size,
             page_count,
+            block_size,
         };
         let config = ClientConfig {
             url: "ws://scripted".into(),
@@ -1038,6 +1062,38 @@ mod tests {
             Database::open(&mut client, "db", options(Some(1)), &mut Stats::default())
                 .unwrap_or_else(|err| panic!("page size {page_size}, page count {page_count}: {err:?}"));
         }
+    }
+
+    #[test]
+    fn blocks_of_another_size_than_the_page_size_are_refused() {
+        // A shorter block would panic at the first read in the page store, a longer one would be committed back.
+        for block_size in [0, 100, PAGE as usize - 1, PAGE as usize + 1] {
+            let (mut client, _) = scripted_sending(0, PAGE, 2, block_size);
+            let err = Database::open(&mut client, "db", options(None), &mut Stats::default())
+                .err()
+                .unwrap_or_else(|| panic!("blocks of {block_size} bytes must be refused"));
+            assert!(matches!(err, ClientError::Protocol(_)), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn blocks_of_another_size_fail_the_read_on_demand() {
+        let (mut client, _) = scripted_sending(0, PAGE, 2, 100);
+        let mut stats = Stats::default();
+        let mut db = Database::open(&mut client, "db", options(Some(1)), &mut stats).unwrap();
+        let mut buf = vec![0u8; PAGE as usize];
+        let result = db.read(&mut client, &mut buf, 0, &mut stats);
+        assert!(matches!(result, Err(Broken::Refused(_))), "{result:?}");
+    }
+
+    #[test]
+    fn blocks_of_the_page_size_are_read() {
+        let (mut client, _) = scripted(0, PAGE, 2);
+        let mut stats = Stats::default();
+        let mut db = Database::open(&mut client, "db", options(None), &mut stats).unwrap();
+        let mut buf = vec![0u8; PAGE as usize];
+        assert!(db.read(&mut client, &mut buf, PAGE.into(), &mut stats).unwrap());
+        assert!(buf.iter().all(|&byte| byte == 0x5a));
     }
 
     #[test]
