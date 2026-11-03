@@ -61,7 +61,43 @@ pub struct SqliteRemoteVfsConfig {
     pub extra_roots: *const *const u8,
     pub extra_root_lens: *const usize,
     pub extra_roots_count: usize,
+    /// 64 bits wide, so that the struct is larger than that of version 0.5.0 on every target. On a target with
+    /// 4-byte pointers and 8-byte alignment of `u64`, such as wasm32, the 0.5.0 struct ends in 4 bytes of padding,
+    /// which an `int` would fill without changing the size.
+    pub refuse_plaintext: u64,
 }
+
+/// The struct of version 0.5.0, before `refuse_plaintext`, verbatim. A program built against that header passes its
+/// size, which is accepted; the fields after it have their defaults.
+#[repr(C)]
+#[allow(dead_code)]
+struct SqliteRemoteVfsConfig0_5 {
+    struct_size: usize,
+    url: *const c_char,
+    algorithm: c_int,
+    public_key: *const u8,
+    public_key_len: usize,
+    sign: Option<SignFn>,
+    sign_context: *mut c_void,
+    local_copy_path: *const c_char,
+    memory_blocks: u64,
+    blocks_per_fetch: u64,
+    page_size: u32,
+    timeout_ms: u32,
+    reconnect_timeout_ms: u32,
+    takeover: c_int,
+    extra_roots: *const *const u8,
+    extra_root_lens: *const usize,
+    extra_roots_count: usize,
+}
+
+/// `struct_size` of a configuration built against the header of version 0.5.0.
+pub const STRUCT_SIZE_0_5: usize = size_of::<SqliteRemoteVfsConfig0_5>();
+
+// A 0.5.0 configuration is told apart by its size, and none of its bytes, padding included, lands in the field after
+// it when they are copied into the current struct.
+const _: () = assert!(STRUCT_SIZE_0_5 < size_of::<SqliteRemoteVfsConfig>());
+const _: () = assert!(std::mem::offset_of!(SqliteRemoteVfsConfig, refuse_plaintext) >= STRUCT_SIZE_0_5);
 
 /// A [`Signer`] that calls the application's sign function.
 struct CallbackSigner {
@@ -148,7 +184,7 @@ unsafe fn bytes(ptr: *const u8, len: usize, what: &str) -> Result<Vec<u8>, Failu
 /// # Safety
 /// All pointers in `c` follow the contract in the header.
 unsafe fn config(c: &SqliteRemoteVfsConfig) -> Result<Config, Failure> {
-    if c.struct_size != size_of::<SqliteRemoteVfsConfig>() {
+    if c.struct_size != size_of::<SqliteRemoteVfsConfig>() && c.struct_size != STRUCT_SIZE_0_5 {
         return Err(misuse("struct_size must be sizeof(sqlite_remote_vfs_config)"));
     }
     // SAFETY: per the header.
@@ -207,6 +243,7 @@ unsafe fn config(c: &SqliteRemoteVfsConfig) -> Result<Config, Failure> {
         config.timeout = Duration::from_millis(c.timeout_ms.into());
     }
     config.takeover = c.takeover != 0;
+    config.refuse_plaintext = c.refuse_plaintext != 0;
     Ok(config)
 }
 
@@ -220,8 +257,22 @@ unsafe fn register(name: *const c_char, config_ptr: *const SqliteRemoteVfsConfig
     if config_ptr.is_null() {
         return Err(misuse("config is NULL"));
     }
-    // SAFETY: not NULL, and points to a config per the header.
-    let config = unsafe { config(&*config_ptr) }?;
+    // The caller's struct may be the shorter one of version 0.5.0, so it is not referenced as a whole. Its
+    // `struct_size` bytes are copied into a zeroed struct: every field is an integer, a pointer or an `Option` of a
+    // function pointer, for which zero is a valid value and the default.
+    // SAFETY: not NULL, and `struct_size` is the first field of every version of the struct.
+    let size = unsafe { std::ptr::addr_of!((*config_ptr).struct_size).read_unaligned() };
+    if size != size_of::<SqliteRemoteVfsConfig>() && size != STRUCT_SIZE_0_5 {
+        return Err(misuse("struct_size must be sizeof(sqlite_remote_vfs_config)"));
+    }
+    let mut full = std::mem::MaybeUninit::<SqliteRemoteVfsConfig>::zeroed();
+    // SAFETY: the caller's struct has `size` readable bytes per the header, and `full` has room for them.
+    let c = unsafe {
+        std::ptr::copy_nonoverlapping(config_ptr.cast::<u8>(), full.as_mut_ptr().cast::<u8>(), size);
+        full.assume_init()
+    };
+    // SAFETY: points to a config per the header.
+    let config = unsafe { config(&c) }?;
     let vfs = RemoteVfs::register(&name, config).map_err(|err| Failure(SQLITE_ERROR, err.to_string()))?;
     // The VFS stays registered for the life of the process, so its handle, and with it the ping thread, is kept.
     REGISTERED

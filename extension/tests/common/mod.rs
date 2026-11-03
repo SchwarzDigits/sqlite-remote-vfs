@@ -96,6 +96,7 @@ impl Login {
             extra_roots: std::ptr::null(),
             extra_root_lens: std::ptr::null(),
             extra_roots_count: 0,
+            refuse_plaintext: 0,
         }
     }
 }

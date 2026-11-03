@@ -1,6 +1,7 @@
 //! The static library: the C interface linked into a program together with plain SQLite.
 //!
-//! `database_round_trips_with_plain_sqlite` needs `SQLITE_REMOTE_TEST_URL` and is skipped without it.
+//! `database_round_trips_with_plain_sqlite` and `plaintext_is_refused_when_configured` need `SQLITE_REMOTE_TEST_URL`
+//! and are skipped without it.
 
 mod common;
 
@@ -50,6 +51,14 @@ fn invalid_arguments_are_misuse() {
     let (rc, error) = call(sqlite_remote_vfs_register, sqlite_remote_vfs_free, &name, &config);
     assert_eq!(rc, SQLITE_MISUSE);
     assert!(error.unwrap().contains("algorithm"));
+
+    // The struct of version 0.5.0, without `refuse_plaintext`, is accepted: the registration then fails at the
+    // server, not at the size.
+    let mut config = login.config();
+    config.struct_size = sqlite_remote_vfs_ffi::STRUCT_SIZE_0_5;
+    let (rc, error) = call(sqlite_remote_vfs_register, sqlite_remote_vfs_free, &name, &config);
+    assert_eq!(rc, SQLITE_ERROR);
+    assert!(error.unwrap().contains("127.0.0.1:1"));
 
     // SAFETY: a NULL name is allowed and rejected. NULL error pointer: no message.
     let rc = unsafe { sqlite_remote_vfs_register(std::ptr::null(), &login.config(), std::ptr::null_mut()) };
@@ -114,4 +123,27 @@ fn database_deletes_through_c_interface() {
     let (rc, error) = common::call_delete(sqlite_remote_vfs_delete_database, sqlite_remote_vfs_free, &name, c"db");
     assert_eq!(rc, 0, "delete: {error:?}");
     assert_eq!(common::tables(&name), 0, "the database must come back empty");
+}
+
+#[test]
+fn plaintext_is_refused_when_configured() {
+    let Some(url) = common::server_url() else { return };
+    let login = Login::new(&url);
+    let name = unique("static-plaintext");
+    let mut config = login.config();
+    config.refuse_plaintext = 1;
+    let (rc, error) = call(sqlite_remote_vfs_register, sqlite_remote_vfs_free, &name, &config);
+    assert_eq!(rc, 0, "register: {error:?}");
+
+    // Plain SQLite writes page 1 with its header in the clear, which the configured VFS refuses.
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+    let conn = rusqlite::Connection::open_with_flags_and_vfs("db", flags, name.to_str().unwrap()).expect("open");
+    let err = conn
+        .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)")
+        .expect_err("plain SQLite must not store page 1");
+    assert_eq!(
+        err.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::PermissionDenied),
+        "{err}"
+    );
 }

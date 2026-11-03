@@ -36,7 +36,8 @@ typedef int (*sqlite_remote_vfs_sign_fn)(void *context, const uint8_t *message, 
                                          uint8_t *signature, size_t signature_capacity, size_t *signature_len);
 
 typedef struct sqlite_remote_vfs_config {
-    /* Must be sizeof(sqlite_remote_vfs_config). */
+    /* Must be sizeof(sqlite_remote_vfs_config). A program built against the header of version 0.5.0, before
+     * refuse_plaintext, passes the smaller size of that version and gets the default for the fields after it. */
     size_t struct_size;
     /* WebSocket URL of the page server, e.g. "wss://vfs.example/v1/ws". Required. */
     const char *url;
@@ -65,6 +66,14 @@ typedef struct sqlite_remote_vfs_config {
     const uint8_t *const *extra_roots;
     const size_t *extra_root_lens;
     size_t extra_roots_count;
+    /* Nonzero: refuse plaintext. A read or write of page 1 that carries an unencrypted SQLite header fails with
+     * SQLITE_PERM, so that a database is never stored in plaintext by mistake, e.g. when the program linked plain
+     * SQLite instead of SQLCipher and PRAGMA key was silently ignored. A write transaction rolls back.
+     * Not for a database with a plaintext header of more than 72 bytes (plaintext_header_size in SQLite3 Multiple
+     * Ciphers, cipher_plaintext_header_size in SQLCipher): its page 1 can then pass as plaintext.
+     * 64 bits wide, so that the struct is larger than that of version 0.5.0 on every target: on a target with 4-byte
+     * pointers the 0.5.0 struct ends in padding, which an int would fill without changing the size. */
+    uint64_t refuse_plaintext;
 } sqlite_remote_vfs_config;
 
 /*

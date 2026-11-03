@@ -41,7 +41,9 @@ web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "MessageEven
 ed25519-dalek = { version = "2", default-features = false }
 getrandom = "0.3"
 # SQLite3 Multiple Ciphers instead of plain SQLite, so the tests run with encryption above the VFS.
-libsqlite3-sys = { version = "0.36", default-features = false, features = ["bundled-sqlite3mc"] }
+# The default features stay on: the build script refers to pkg-config and vcpkg, which they bring, also when it
+# bundles SQLite.
+libsqlite3-sys = { version = "0.36", features = ["bundled-sqlite3mc"] }
 rcgen = "0.14"
 rusqlite = { version = "0.38", default-features = false, features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

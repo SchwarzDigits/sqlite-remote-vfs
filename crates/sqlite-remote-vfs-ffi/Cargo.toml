@@ -18,4 +18,6 @@ sqlite-remote-vfs = { version = "0.5.0", path = "../sqlite-remote-vfs" }
 
 [dev-dependencies]
 # SQLite for the unit test binary, see src/lib.rs.
-libsqlite3-sys = { version = "0.36", default-features = false, features = ["bundled-sqlite3mc"] }
+# The default features stay on: the build script refers to pkg-config and vcpkg, which they bring, also when it
+# bundles SQLite.
+libsqlite3-sys = { version = "0.36", features = ["bundled-sqlite3mc"] }

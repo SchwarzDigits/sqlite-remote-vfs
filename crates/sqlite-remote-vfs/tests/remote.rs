@@ -1290,3 +1290,80 @@ fn deleting_a_missing_database_succeeds() {
     vfs.delete_database("never-created").expect("first delete");
     vfs.delete_database("never-created").expect("second delete");
 }
+
+/// Opens a database through the plain VFS name, so SQLite3 Multiple Ciphers does not encrypt: what a build that
+/// linked plain SQLite, or forgot the key, would store.
+fn open_unencrypted(vfs: &RemoteVfs, db: &str) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let conn = Connection::open_with_flags_and_vfs(db, flags, vfs.name())?;
+    let mode: String = conn.query_row("PRAGMA journal_mode = MEMORY", [], |row| row.get(0))?;
+    assert_eq!(mode, "memory");
+    Ok(conn)
+}
+
+#[test]
+fn refused_plaintext_lets_an_encrypted_database_through() {
+    let Some(url) = server_url() else { return };
+    let mut config = Config::server(url, TestSigner::fresh());
+    config.refuse_plaintext = true;
+    let vfs = register(config);
+
+    let conn = open(&vfs, "db", &KEY).unwrap();
+    conn.execute_batch(CREATE).unwrap();
+    insert_rows(&conn, 0, 10, 100);
+    drop(conn);
+
+    let conn = open(&vfs, "db", &KEY).unwrap();
+    let rows: i64 = conn.query_row("SELECT count(*) FROM t", [], |row| row.get(0)).unwrap();
+    assert_eq!(rows, 10);
+    assert_eq!(vfs.failure(), None);
+}
+
+#[test]
+fn refused_plaintext_fails_the_first_commit_of_an_unencrypted_database() {
+    let Some(url) = server_url() else { return };
+    let signer = TestSigner::fresh();
+    let mut config = Config::server(url.clone(), Arc::clone(&signer));
+    config.refuse_plaintext = true;
+    let vfs = register(config);
+
+    let conn = open_unencrypted(&vfs, "db").unwrap();
+    let err = conn
+        .execute_batch(CREATE)
+        .expect_err("page 1 with a plaintext header must not be written");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::PermissionDenied), "{err}");
+    assert_eq!(vfs.failure(), Some(Failure::Plaintext));
+    drop(conn);
+
+    // Nothing reached the server: the database is still empty for a VFS that allows plaintext.
+    let allowing = register(Config::server(url, signer));
+    let conn = open_unencrypted(&allowing, "db").unwrap();
+    let tables: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(tables, 0, "the refused commit must not have reached the server");
+}
+
+#[test]
+fn refused_plaintext_fails_the_read_of_a_database_stored_in_plaintext() {
+    let Some(url) = server_url() else { return };
+    let signer = TestSigner::fresh();
+
+    // Stored in plaintext by a VFS that allows it.
+    let allowing = register(Config::server(url.clone(), Arc::clone(&signer)));
+    let conn = open_unencrypted(&allowing, "db").unwrap();
+    conn.execute_batch(CREATE).unwrap();
+    drop(conn);
+
+    // The same subject with a VFS that refuses plaintext: the header read fails. SQLite3 Multiple Ciphers reads the
+    // header when it opens the file, plain SQLite at the first statement, so either call may be the one that fails.
+    let mut config = Config::server(url, signer);
+    config.refuse_plaintext = true;
+    let refusing = register(config);
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let err = Connection::open_with_flags_and_vfs("db", flags, refusing.name())
+        .and_then(|conn| conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get::<_, i64>(0)))
+        .expect_err("a plaintext header must not be read");
+    assert_eq!(err.sqlite_error_code(), Some(ErrorCode::PermissionDenied), "{err}");
+    assert_eq!(refusing.failure(), Some(Failure::Plaintext));
+}

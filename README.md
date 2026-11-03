@@ -19,7 +19,11 @@ Status: works and is tested, not yet in production use. Versions are 0.x: the pr
 - **Encryption above the VFS.** The VFS itself does not encrypt and depends on no encryption library. Encryption that
   runs above it keeps plaintext and the database key away from the server. Tested with SQLite3 Multiple Ciphers
   (open through `RemoteVfs::encrypted_name()`) and SQLCipher (open through `RemoteVfs::name()`), in both cases with
-  `PRAGMA key`. With plain SQLite the server stores plaintext.
+  `PRAGMA key`. With plain SQLite the server stores plaintext. `Config::refuse_plaintext` guards against that by
+  mistake: a read or write of page 1 with an unencrypted SQLite header then fails with `SQLITE_PERM`, e.g. when a
+  build linked plain SQLite instead of SQLCipher and `PRAGMA key` was silently ignored, or when `PRAGMA key` was
+  forgotten or given an empty key on a connection through `encrypted_name()`. It needs a plaintext header
+  (`plaintext_header_size`) of at most 72 bytes.
 - **Login by signature.** The application passes a `Signer`: an algorithm, a public key and a sign function. The
   server sends a challenge, verifies the signature and derives the client's subject from the public key. A client
   can only open databases under its own subject. The VFS holds no key material. Supported algorithm: Ed25519.
