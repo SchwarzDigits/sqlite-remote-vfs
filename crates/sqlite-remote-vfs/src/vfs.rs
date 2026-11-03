@@ -171,11 +171,12 @@ impl MainFile {
     }
 
     fn write(&mut self, data: &[u8], offset: u64) -> Result<(), Broken> {
-        // Before the write reaches the blocks in memory, so that a commit cannot send it.
-        if offset == 0 && self.refuses_plaintext(data) {
+        self.heal();
+        // A broken database fails for its own reason, as in `read`. Otherwise the check comes before the write
+        // reaches the blocks in memory, so that a commit cannot send it.
+        if offset == 0 && self.broken().is_none() && self.refuses_plaintext(data) {
             return Err(Broken::Plaintext);
         }
-        self.heal();
         let result = match &mut self.db {
             Db::Server(db) => db.write(
                 &mut lock(&self.inner.server().client),
@@ -227,17 +228,21 @@ impl MainFile {
         refused
     }
 
+    /// Why the database is broken, if it is.
+    fn broken(&self) -> Option<&Broken> {
+        match &self.db {
+            Db::Server(db) => db.broken(),
+            #[cfg(target_arch = "wasm32")]
+            Db::Local(db) => db.broken(),
+        }
+    }
+
     /// Records why the database broke, if the operation that returned `result` broke it.
     fn record<T>(&self, result: Result<T, Broken>) -> Result<T, Broken> {
-        if result.is_err() {
-            let broken = match &self.db {
-                Db::Server(db) => db.broken(),
-                #[cfg(target_arch = "wasm32")]
-                Db::Local(db) => db.broken(),
-            };
-            if let Some(broken) = broken {
-                *lock(&self.inner.failure) = Some(failure_of(broken));
-            }
+        if result.is_err()
+            && let Some(broken) = self.broken()
+        {
+            *lock(&self.inner.failure) = Some(failure_of(broken));
         }
         result
     }

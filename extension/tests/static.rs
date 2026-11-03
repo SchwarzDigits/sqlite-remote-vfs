@@ -55,7 +55,7 @@ fn invalid_arguments_are_misuse() {
     // The struct of version 0.5.0, without `refuse_plaintext`, is accepted: the registration then fails at the
     // server, not at the size.
     let mut config = login.config();
-    config.struct_size = std::mem::offset_of!(sqlite_remote_vfs_ffi::SqliteRemoteVfsConfig, refuse_plaintext);
+    config.struct_size = sqlite_remote_vfs_ffi::STRUCT_SIZE_0_5;
     let (rc, error) = call(sqlite_remote_vfs_register, sqlite_remote_vfs_free, &name, &config);
     assert_eq!(rc, SQLITE_ERROR);
     assert!(error.unwrap().contains("127.0.0.1:1"));

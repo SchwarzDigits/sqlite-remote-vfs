@@ -68,8 +68,10 @@ typedef struct sqlite_remote_vfs_config {
     size_t extra_roots_count;
     /* Nonzero: refuse plaintext. A read or write of page 1 that carries an unencrypted SQLite header fails with
      * SQLITE_PERM, so that a database is never stored in plaintext by mistake, e.g. when the program linked plain
-     * SQLite instead of SQLCipher and PRAGMA key was silently ignored. A write transaction rolls back. */
-    int refuse_plaintext;
+     * SQLite instead of SQLCipher and PRAGMA key was silently ignored. A write transaction rolls back.
+     * 64 bits wide, so that the struct is larger than that of version 0.5.0 on every target: on a target with 4-byte
+     * pointers the 0.5.0 struct ends in padding, which an int would fill without changing the size. */
+    uint64_t refuse_plaintext;
 } sqlite_remote_vfs_config;
 
 /*
