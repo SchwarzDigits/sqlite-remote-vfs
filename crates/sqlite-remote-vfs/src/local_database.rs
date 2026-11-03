@@ -10,7 +10,7 @@
 
 use crate::Stats;
 use crate::database::Broken;
-use crate::pages::{Pages, Source};
+use crate::pages::{MAX_PAGE_COUNT, MAX_PAGE_SIZE, Pages, Source};
 use crate::platform::Moment;
 use crate::transport::{LocalBridge, Refusal};
 
@@ -40,6 +40,13 @@ impl LocalDatabase {
     /// Opens the database and takes its lock. With `Load::Preload`, also loads all blocks.
     pub fn open(bridge: LocalBridge, name: &str, options: LocalOptions, stats: &mut Stats) -> Result<Self, Refusal> {
         let opened = bridge.open(name, options.page_size, options.create, options.takeover)?;
+        // The stored head sizes the blocks in memory. A damaged one is not followed.
+        if opened.page_size == 0 || opened.page_size > MAX_PAGE_SIZE || opened.page_count > MAX_PAGE_COUNT {
+            return Err(Refusal::Failed(format!(
+                "stored head with page size {} and page count {}",
+                opened.page_size, opened.page_count
+            )));
+        }
         let mut db = LocalDatabase {
             pages: Pages::new(
                 opened.page_size as usize,
@@ -175,6 +182,14 @@ impl Source for Load<'_> {
                 }
                 other => Broken::Refused(other.to_string()),
             })?;
+            // The page store slices blocks by the page size. A stored block of another size is not followed.
+            if let Some(data) = blocks.iter().find(|data| data.len() != pages.page_size()) {
+                return Err(Broken::Refused(format!(
+                    "stored block of {} bytes, expected {}",
+                    data.len(),
+                    pages.page_size()
+                )));
+            }
             stats.local_reads += 1;
             stats.local_blocks_read += n;
             for (offset, data) in blocks.into_iter().enumerate() {

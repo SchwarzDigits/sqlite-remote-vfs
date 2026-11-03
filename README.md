@@ -217,7 +217,8 @@ sqlite3_open_v2("app.db", &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "remo
 
 The server stores the main database file as numbered blocks of the page size, plus a version number per database
 that increases with every commit. Journals and temporary files stay in the client's memory. WAL mode is not
-available, because the VFS provides no shared memory.
+available, because the VFS provides no shared memory. The client follows the page size and page count the server
+reports only within SQLite's limits; other values fail the open instead of sizing anything.
 
 Client and server exchange Protocol Buffers messages over a WebSocket, one binary frame per message. The protocol is
 defined in `proto/sqlite_remote/v1/sqlite_remote.proto`. `proto/testdata/v1/` contains one encoded sample of every
