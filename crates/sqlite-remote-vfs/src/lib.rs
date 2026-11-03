@@ -220,6 +220,11 @@ pub struct Config {
     /// and `PRAGMA key` was silently ignored. SQLite gets `SQLITE_PERM`, a write transaction rolls back, and
     /// [`RemoteVfs::failure`] reports [`Failure::Plaintext`]. Off by default: with plain SQLite the server stores
     /// plaintext, see the README.
+    ///
+    /// Not for a database with a plaintext header of more than 72 bytes (`plaintext_header_size` in SQLite3 Multiple
+    /// Ciphers, `cipher_plaintext_header_size` in SQLCipher): the check needs the reserved bytes 72 to 91 of page 1
+    /// encrypted. With a larger plaintext header, page 1 of the encrypted database can pass as plaintext, and from
+    /// 92 bytes on always does.
     pub refuse_plaintext: bool,
     /// Timeout for connecting and for each response of the server, or of the connection worker in a browser.
     pub timeout: Duration,

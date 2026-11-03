@@ -100,8 +100,10 @@ fn broken_error(broken: &Broken, code: VfsErrorCode) -> VfsError {
 /// Whether `page` starts with an unencrypted SQLite file header: the magic string, the fixed bytes 21 to 23 and the
 /// 20 reserved bytes from 72 on, which are zero. Encryption above the VFS leaves none of these intact: SQLCipher and
 /// SQLite3 Multiple Ciphers replace the magic string with a salt or encrypt from byte 24 on at the latest. Only a
-/// plaintext header (`cipher_plaintext_header_size`) of 96 bytes or more would pass as plaintext, which is nothing
-/// a database that is meant to be encrypted uses.
+/// plaintext header (`plaintext_header_size`, `cipher_plaintext_header_size`) that reaches into the reserved bytes
+/// can pass as plaintext: one of more than 72 bytes by chance, one of 92 bytes or more always. SQLite3 Multiple
+/// Ciphers allows up to 100, SQLCipher multiples of 16. [`Config::refuse_plaintext`](crate::Config::refuse_plaintext)
+/// says so.
 fn plaintext_header(page: &[u8]) -> bool {
     page.len() >= 92
         && page.starts_with(b"SQLite format 3\0")
@@ -816,6 +818,19 @@ mod tests {
         let mut header_32 = from_24.clone();
         header_32[..32].copy_from_slice(&plain_page1()[..32]);
         assert!(!plaintext_header(&header_32));
+
+        // The largest plaintext header `Config::refuse_plaintext` supports: the reserved bytes are still encrypted.
+        let mut header_72 = from_24.clone();
+        header_72[..72].copy_from_slice(&plain_page1()[..72]);
+        assert!(!plaintext_header(&header_72));
+
+        // The documented limit: a plaintext header of 92 bytes or more passes as plaintext.
+        let mut header_92 = from_24.clone();
+        header_92[..92].copy_from_slice(&plain_page1()[..92]);
+        assert!(
+            plaintext_header(&header_92),
+            "the limit in the documentation of Config::refuse_plaintext"
+        );
 
         // Fully encrypted, including the magic string.
         let mut all = plain_page1();
